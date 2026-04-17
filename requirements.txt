@@ -1,0 +1,7 @@
+anthropic
+openai
+chromadb
+pysqlite3-binary
+jieba
+akshare
+schedule
