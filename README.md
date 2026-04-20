@@ -24,17 +24,62 @@ git clone <repo-url>
 cd stock_agent
 ```
 
-**第二步：创建 `.env` 文件**
+**第二步：配置环境变量**
 
-在项目根目录新建 `.env`，填入以下内容：
+项目通过 `.env` 文件把变量注入 Docker 容器，有两种方式二选一：
+
+---
+
+### 方式一：`.env` 文件（推荐，最简单）
+
+在项目根目录新建 `.env`，填入以下内容（参考 `.env.example`）：
 
 ```env
-DEEPSEEK_API_KEY_stock_agent=你的DeepSeek_API_Key
+DEEPSEEK_API_KEY_stock_agent=sk-xxxxxxxxxxxxxxxx
 
 MAIL_USER=你的QQ邮箱@qq.com
-MAIL_PASS=你的SMTP授权码
-MAIL_TO=接收报告的邮箱
+MAIL_PASS=你的SMTP授权码（16位字母，不是QQ密码）
+MAIL_TO=接收报告的邮箱地址
 ```
+
+`docker compose up` 会自动读取同目录的 `.env`，无需额外操作。
+
+> `.env` 已加入 `.gitignore`，不会被提交到 git。
+
+---
+
+### 方式二：系统环境变量（多项目共用 Key 时更方便）
+
+在 **PowerShell** 里设置（当前会话有效）：
+
+```powershell
+$env:DEEPSEEK_API_KEY_stock_agent = "sk-xxxxxxxxxxxxxxxx"
+$env:MAIL_USER = "你的QQ邮箱@qq.com"
+$env:MAIL_PASS = "你的SMTP授权码"
+$env:MAIL_TO   = "接收报告的邮箱地址"
+```
+
+若要**永久生效**（重启终端后仍有效），改用：
+
+```powershell
+[System.Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY_stock_agent", "sk-xxxxxxxxxxxxxxxx", "User")
+[System.Environment]::SetEnvironmentVariable("MAIL_USER", "你的QQ邮箱@qq.com", "User")
+[System.Environment]::SetEnvironmentVariable("MAIL_PASS", "你的SMTP授权码", "User")
+[System.Environment]::SetEnvironmentVariable("MAIL_TO",   "接收报告的邮箱地址", "User")
+```
+
+设置后**重新打开 PowerShell**，`docker compose up` 会通过 `docker-compose.yml` 里的 `${VAR}` 语法自动将系统变量传入容器。
+
+---
+
+### 验证变量是否正确传入容器
+
+```powershell
+docker compose exec scheduler env | findstr DEEPSEEK
+docker compose exec scheduler env | findstr MAIL
+```
+
+有输出即表示变量已生效。
 
 ---
 
