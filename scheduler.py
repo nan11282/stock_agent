@@ -251,6 +251,14 @@ class DailyScanner:
         print(f"[{datetime.now().isoformat()}] 扫描完成")
 
 
+def _already_scanned_today(scanner: "DailyScanner") -> bool:
+    today = datetime.now().strftime("%Y-%m-%d")
+    row = scanner.memory.decisions.conn.execute(
+        "SELECT 1 FROM scan_results WHERE scanned_at >= ? LIMIT 1", (today,)
+    ).fetchone()
+    return row is not None
+
+
 def main():
     parser = argparse.ArgumentParser(description="A股投资助理 - 定时扫描")
     parser.add_argument("--now", action="store_true", help="立即执行一次扫描")
@@ -261,6 +269,13 @@ def main():
     if args.now:
         scanner.run()
         return
+
+    # 启动时补发：若已过 15:30 且今天尚未扫描，立即执行一次
+    now = datetime.now()
+    trigger = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    if now >= trigger and not _already_scanned_today(scanner):
+        print(f"[{now.isoformat()}] 检测到今日扫描未执行，立即补发...")
+        scanner.run()
 
     print("定时任务已启动，每天 15:30 执行扫描...")
     schedule.every().day.at("15:30").do(scanner.run)

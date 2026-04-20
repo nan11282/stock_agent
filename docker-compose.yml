@@ -26,6 +26,8 @@ services:
       - MAIL_USER=${MAIL_USER}
       - MAIL_PASS=${MAIL_PASS}
       - MAIL_TO=${MAIL_TO}
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
     volumes:
       - ./data:/app/data
       - ./chroma_db:/app/chroma_db
