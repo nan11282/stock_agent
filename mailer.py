@@ -159,3 +159,79 @@ def send_report(summary: str, positions: list[dict],
     with smtplib.SMTP_SSL(MAIL_HOST, MAIL_PORT) as server:
         server.login(MAIL_USER, MAIL_PASS)
         server.sendmail(MAIL_USER, MAIL_TO.split(","), msg.as_string())
+
+
+# ── IMAP 邮件触发器 ─────────────────────────
+
+IMAP_HOST = os.environ.get("MAIL_IMAP_HOST", "imap.qq.com")
+IMAP_PORT = int(os.environ.get("MAIL_IMAP_PORT", "993"))
+
+def listen_for_trigger(on_trigger, interval: int = 120):
+    """后台线程：IMAP 轮询收件箱，检测到主题含"扫描"的未读邮件即触发回调。
+
+    QQ邮箱手机端发邮件 → scheduler 检测到 → 自动跑扫描 → 回复报告。
+    IMAP 连接开销 ~0.1s/次，interval 秒轮询一次，CPU/内存几乎为零。
+    """
+    import imaplib
+    import email.header
+    import threading
+    import time as _time
+    from datetime import datetime as _dt
+
+    # 去重：记录最近触发过的邮件 ID，避免重复扫描
+    _triggered_ids: set = set()
+
+    def _poll():
+        while True:
+            try:
+                mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+                mail.login(MAIL_USER, MAIL_PASS)
+                mail.select("INBOX")
+                # 只查最近 50 封，只看自己发来的
+                status, data = mail.search(None, "ALL")
+                triggered = False
+                if data and data[0]:
+                    all_ids = data[0].split()
+                    recent_ids = all_ids[-50:]
+                    checked = 0
+                    for num in recent_ids:
+                        if num in _triggered_ids:
+                            continue
+                        _, msg_data = mail.fetch(num, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+                        raw = b""
+                        for part in msg_data:
+                            if isinstance(part, tuple):
+                                raw = part[1]
+                        text = raw.decode("utf-8", errors="ignore")
+                        # 仅响应自己发来的触发邮件，避免系统报告自循环
+                        if MAIL_USER.lower() not in text.lower():
+                            continue
+                        # 提取主题
+                        subject = ""
+                        for line in text.split("\n"):
+                            if line.lower().startswith("subject:"):
+                                decoded = email.header.decode_header(line[8:].strip())
+                                subject = "".join(
+                                    (s.decode(c or "utf-8") if isinstance(s, bytes) else s)
+                                    for s, c in decoded
+                                )
+                                break
+                        if any(kw in subject for kw in ["扫描"]):
+                            triggered = True
+                            _triggered_ids.add(num)
+                            print(f"[IMAP-{_dt.now().strftime('%H:%M:%S')}] !!触发!! #{num.decode()} \"{subject[:60]}\"")
+                            break
+                        checked += 1
+                    if not triggered:
+                        print(f"[IMAP-{_dt.now().strftime('%H:%M:%S')}] 最近{len(recent_ids)}封中检查{checked}封(自己发的)，无触发词匹配")
+                mail.logout()
+                if triggered:
+                    on_trigger()
+            except Exception as e:
+                import traceback
+                print(f"[IMAP轮询] 异常: {e}")
+                traceback.print_exc()
+            _time.sleep(interval)
+
+    t = threading.Thread(target=_poll, daemon=True)
+    t.start()

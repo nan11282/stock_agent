@@ -16,7 +16,7 @@ from memory import MemoryManager
 READ_TOOLS = [
     {
         "name": "get_stock_data",
-        "description": "获取A股实时行情与估值：当前价格、PE、PB、TTM股息率。Agent可自主调用。",
+        "description": "获取A股实时行情与估值：当前价格、PE、PB、TTM股息率、PE历史百分位（当前PE在近10年中的分位，越低越便宜）。Agent可自主调用。",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -260,6 +260,34 @@ ALL_TOOLS = READ_TOOLS + WRITE_TOOLS
 # Tool Executor
 # ─────────────────────────────────────────────
 
+# ── 共享工具函数 ──────────────────────────
+
+def exchange_prefix(stock_code: str) -> str:
+    """根据A股代码推断交易所前缀，返回 'sh' 或 'sz'。"""
+    if stock_code.startswith(("6", "68")):
+        return "sh"
+    return "sz"
+
+
+def fetch_tencent_quote(stock_code: str) -> dict:
+    """从腾讯行情 API 获取单只股票实时数据。"""
+    import requests
+    prefix = exchange_prefix(stock_code)
+    url = f"http://qt.gtimg.cn/q={prefix}{stock_code}"
+    r = requests.get(url, timeout=10)
+    r.encoding = "gbk"
+    fields = r.text.split("~")
+    return {
+        "name":           fields[1],
+        "price":          float(fields[3]) if fields[3] else 0.0,
+        "pe_ttm":         fields[39],
+        "pb":             fields[46],
+        "market_cap_bn":  fields[45],
+        "52w_high":       fields[47],
+        "52w_low":        fields[48],
+    }
+
+
 class ToolExecutor:
     def __init__(self, memory: MemoryManager):
         self.memory = memory
@@ -274,46 +302,141 @@ class ToolExecutor:
         except Exception as e:
             return json.dumps({"error": str(e), "tool": tool_name}, ensure_ascii=False)
 
+    # ── PE 历史百分位计算（内部复用）────────────
+
+    @staticmethod
+    def _compute_pe_percentile(stock_code: str, current_pe: float) -> dict:
+        """计算当前 PE 在近 10 年历史中的分位。返回 pe_percentile_pct 等字段。"""
+        import akshare as ak
+        import pandas as pd
+
+        try:
+            # 年度财务数据（EPS）
+            fin_df = ak.stock_financial_abstract_ths(
+                symbol=stock_code, indicator="按年度"
+            )
+            if fin_df.empty or "基本每股收益" not in fin_df.columns:
+                return {"pe_percentile_pct": None, "pe_percentile_note": "无财务EPS数据"}
+
+            # 10年日K线（腾讯源，Docker 内可用）
+            end_date = pd.Timestamp.now().strftime("%Y%m%d")
+            start_date = (pd.Timestamp.now() - pd.DateOffset(years=10)).strftime("%Y%m%d")
+            prefix = exchange_prefix(stock_code)
+            price_df = ak.stock_zh_a_hist_tx(
+                symbol=f"{prefix}{stock_code}", start_date=start_date,
+                end_date=end_date, adjust="qfq",
+            )
+            if price_df.empty:
+                return {"pe_percentile_pct": None, "pe_percentile_note": "无历史价格数据"}
+
+            price_df["date"] = pd.to_datetime(price_df["date"])
+
+            # 每年报告期找最近交易日收盘价，计算该年 PE
+            # 财务数据按年份升序排列，取最近 10 年且落在 K 线范围内的
+            fin_df = fin_df.sort_values("报告期", ascending=False)
+            historical_pes = []
+            for _, row in fin_df.iterrows():
+                try:
+                    # 报告期是纯年份（如 2024），转为当年最后一天
+                    year_str = str(row["报告期"]).strip()
+                    year = int(year_str[:4])
+                    report_date = pd.Timestamp(year=year, month=12, day=31)
+                    # 只匹配有价格数据的年份
+                    if report_date < price_df["date"].min():
+                        continue
+
+                    eps_str = row["基本每股收益"]
+                    if eps_str is None or str(eps_str).lower() in ("false", "true", ""):
+                        continue
+                    eps = float(eps_str)
+                    if eps <= 0:
+                        continue
+
+                    nearby = price_df[price_df["date"] <= report_date]
+                    if nearby.empty:
+                        continue
+                    close_price = float(nearby.iloc[-1]["close"])
+                    if close_price > 0:
+                        historical_pes.append(round(close_price / eps, 2))
+                except (ValueError, TypeError, KeyError):
+                    continue
+
+            if len(historical_pes) < 3:
+                return {
+                    "pe_percentile_pct": None,
+                    "pe_percentile_note": f"仅{len(historical_pes)}年有效PE数据，需≥3年",
+                }
+
+            count_below = sum(1 for pe in historical_pes if pe < current_pe)
+            percentile = round(count_below / len(historical_pes) * 100, 1)
+
+            return {
+                "pe_percentile_pct":   percentile,
+                "pe_percentile_years": len(historical_pes),
+                "pe_percentile_lo":    round(min(historical_pes), 1),
+                "pe_percentile_hi":    round(max(historical_pes), 1),
+                "pe_history":          sorted(historical_pes),
+            }
+        except Exception as e:
+            return {"pe_percentile_pct": None, "pe_percentile_note": f"计算失败: {e}"}
+
     # ── READ handlers ─────────────────────────
 
     def _tool_get_stock_data(self, stock_code: str) -> dict:
-        import akshare as ak
+        # 腾讯行情（Docker 内可用，延迟低）
+        try:
+            quote = fetch_tencent_quote(stock_code)
+        except Exception as e:
+            return {"error": f"获取行情失败: {e}", "stock_code": stock_code}
 
-        info_df = ak.stock_individual_info_em(symbol=stock_code)
-        info = dict(zip(info_df["item"], info_df["value"]))
+        price = quote["price"]
+        name = quote["name"]
+        pe_raw = quote["pe_ttm"]
 
-        price = float(info.get("最新", 0) or 0)
-        name = info.get("股票简称", "")
-
+        # TTM 股息率
         ttm_yield = None
         try:
+            import akshare as ak
+            import pandas as pd
             div_df = ak.stock_history_dividend_detail(
                 symbol=stock_code, indicator="分红"
             )
             if not div_df.empty and price > 0:
-                import pandas as pd
                 div_df["除权除息日"] = pd.to_datetime(
                     div_df["除权除息日"], errors="coerce"
                 )
                 cutoff = pd.Timestamp.now() - pd.DateOffset(months=12)
                 recent = div_df[div_df["除权除息日"] >= cutoff]
                 if not recent.empty:
-                    total_div_per_10 = recent["派息(每10股税前)"].astype(float).sum()
+                    total_div_per_10 = recent["派息"].astype(float).sum()
                     div_per_share = total_div_per_10 / 10
                     ttm_yield = round(div_per_share / price * 100, 2)
         except Exception:
             pass
 
+        # PE 历史百分位
+        pe_pct_info = {}
+        try:
+            pe_num = float(pe_raw) if pe_raw else None
+        except (ValueError, TypeError):
+            pe_num = None
+
+        if pe_num and pe_num > 0:
+            pe_pct_info = self._compute_pe_percentile(stock_code, pe_num)
+        else:
+            pe_pct_info = {"pe_percentile_pct": None, "pe_percentile_note": "当前PE无效"}
+
         return {
             "stock_code":    stock_code,
             "name":          name,
             "price":         price,
-            "pe_ttm":        info.get("市盈率(动态)"),
-            "pb":            info.get("市净率"),
-            "market_cap_bn": info.get("总市值"),
+            "pe_ttm":        pe_raw,
+            "pb":            quote["pb"],
+            "market_cap_bn": quote["market_cap_bn"],
             "ttm_yield_pct": ttm_yield,
-            "52w_high":      info.get("52周最高"),
-            "52w_low":       info.get("52周最低"),
+            "52w_high":      quote["52w_high"],
+            "52w_low":       quote["52w_low"],
+            **pe_pct_info,
         }
 
     def _tool_get_dividend_history(self, stock_code: str, years: int = 5) -> list:
@@ -334,15 +457,15 @@ class ToolExecutor:
         records = []
         for _, row in df.iterrows():
             try:
-                div_per_share = float(row["派息(每10股税前)"]) / 10
+                div_per_share = float(row["派息"]) / 10
             except (ValueError, TypeError):
                 div_per_share = None
 
             records.append({
                 "date":            str(row["除权除息日"].date()),
                 "div_per_share":   div_per_share,
-                "bonus_per_10":    row.get("送股(每10股)"),
-                "transfer_per_10": row.get("转增(每10股)"),
+                "bonus_per_10":    row.get("送股"),
+                "transfer_per_10": row.get("转增"),
             })
 
         return records
@@ -357,7 +480,7 @@ class ToolExecutor:
         df = df.head(5)
 
         keep_cols = [
-            "报告期", "营业总收入", "归母净利润", "每股收益",
+            "报告期", "营业总收入", "净利润", "基本每股收益",
             "净资产收益率", "每股净资产", "资产负债率",
         ]
         existing = [c for c in keep_cols if c in df.columns]

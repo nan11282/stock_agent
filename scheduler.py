@@ -16,7 +16,8 @@ import os
 
 from adapters import OpenAIAdapter, Message
 from memory import MemoryManager
-from mailer import send_report
+from mailer import send_report, listen_for_trigger
+from tools import fetch_tencent_quote
 
 
 class DailyScanner:
@@ -32,7 +33,6 @@ class DailyScanner:
 
     def scan_positions(self) -> list[dict]:
         import akshare as ak
-        import pandas as pd
 
         positions = self.memory.decisions.get_positions()
         results = []
@@ -40,15 +40,13 @@ class DailyScanner:
         for pos in positions:
             code = pos["stock_code"]
             try:
-                info_df = ak.stock_individual_info_em(symbol=code)
-                info = dict(zip(info_df["item"], info_df["value"]))
-                price = float(info.get("最新", 0) or 0)
-                pe = info.get("市盈率(动态)")
+                quote = fetch_tencent_quote(code)
+                price = quote["price"]
+                pe = quote["pe_ttm"]
 
                 cost = pos["cost_price"]
                 pnl_pct = round((price - cost) / cost * 100, 2) if cost else None
 
-                # 判断异常
                 signal = "normal"
                 summary_parts = [f"现价{price}"]
                 if pnl_pct is not None:
@@ -96,9 +94,8 @@ class DailyScanner:
         for w in watchlist:
             code = w["stock_code"]
             try:
-                info_df = ak.stock_individual_info_em(symbol=code)
-                info = dict(zip(info_df["item"], info_df["value"]))
-                price = float(info.get("最新", 0) or 0)
+                quote = fetch_tencent_quote(code)
+                price = quote["price"]
 
                 # 计算 TTM 股息率
                 ttm_yield = None
@@ -109,7 +106,7 @@ class DailyScanner:
                         cutoff = pd.Timestamp.now() - pd.DateOffset(months=12)
                         recent = div_df[div_df["除权除息日"] >= cutoff]
                         if not recent.empty:
-                            total = recent["派息(每10股税前)"].astype(float).sum()
+                            total = recent["派息"].astype(float).sum()
                             ttm_yield = round(total / 10 / price * 100, 2)
                 except Exception:
                     pass
@@ -279,6 +276,13 @@ def main():
 
     print("定时任务已启动，每天 15:30 执行扫描...")
     schedule.every().day.at("15:30").do(scanner.run)
+
+    # 手机邮件触发器：给自己发一封主题含"扫描"的邮件即可远程触发
+    def _mobile_trigger():
+        scanner.run()
+
+    listen_for_trigger(_mobile_trigger, interval=120)
+    print("手机触发器已就绪 — 发主题含'扫描'的邮件到收件邮箱即可触发（不限次数）\n")
 
     while True:
         schedule.run_pending()
