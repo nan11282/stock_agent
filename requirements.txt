@@ -5,3 +5,4 @@ pysqlite3-binary
 jieba
 akshare
 schedule
+python-telegram-bot

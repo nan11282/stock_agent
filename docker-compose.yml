@@ -35,6 +35,7 @@ services:
       - MAIL_TO=${MAIL_TO}
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - HTTP_PROXY=http://host.docker.internal:7890
       - HTTPS_PROXY=http://host.docker.internal:7890
       - NO_PROXY=localhost,127.0.0.1

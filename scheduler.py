@@ -16,8 +16,9 @@ import os
 
 from adapters import OpenAIAdapter, Message, ToolResult
 from memory import MemoryManager
-from mailer import send_report, listen_for_trigger
+from mailer import send_report
 from tools import fetch_tencent_quote, READ_TOOLS, ToolExecutor
+from telegram_bot import start_bot
 
 
 class DailyScanner:
@@ -318,16 +319,17 @@ def main():
     print("定时任务已启动，每天 15:30 执行扫描...")
     schedule.every().day.at("15:30").do(scanner.run)
 
-    # 手机邮件触发器：给自己发一封主题含"扫描"的邮件即可远程触发
-    def _mobile_trigger():
-        scanner.run()
+    # schedule 循环放到守护线程，主线程留给 Telegram bot
+    def _schedule_loop():
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
 
-    listen_for_trigger(_mobile_trigger, interval=120)
-    print("手机触发器已就绪 — 发主题含'扫描'的邮件到收件邮箱即可触发（不限次数）\n")
+    import threading
+    threading.Thread(target=_schedule_loop, daemon=True).start()
 
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    # Telegram 聊天助理（阻塞主线程，事件驱动长轮询）
+    start_bot()
 
 
 if __name__ == "__main__":
