@@ -26,6 +26,7 @@ MAIL_TO = os.environ.get("MAIL_TO", "")
 def _build_html(summary: str, positions: list[dict],
                 watchlist: list[dict], discovery: list[dict]) -> str:
     today = date.today().isoformat()
+    summary = summary.replace("\n", "<br>")  # 长文分析换行转 HTML
 
     # 信号标签
     def signal_tag(signal: str, scope: str = "") -> str:

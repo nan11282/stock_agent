@@ -14,10 +14,10 @@ import time
 
 import os
 
-from adapters import OpenAIAdapter, Message
+from adapters import OpenAIAdapter, Message, ToolResult
 from memory import MemoryManager
 from mailer import send_report, listen_for_trigger
-from tools import fetch_tencent_quote
+from tools import fetch_tencent_quote, READ_TOOLS, ToolExecutor
 
 
 class DailyScanner:
@@ -196,26 +196,66 @@ class DailyScanner:
 
         return results
 
-    # ── LLM 生成综合分析 ─────────────────────
+    # ── LLM 深度分析（ReAct + 读工具）─────────
 
-    def _generate_summary(self, pos_results: list, watch_results: list,
-                          disc_results: list) -> str:
-        all_data = json.dumps(
-            {"持仓": pos_results, "自选": watch_results, "发现": disc_results},
-            ensure_ascii=False, indent=2,
-        )
-        try:
-            resp = self.llm.chat(
-                messages=[Message(role="user", text=(
-                    f"以下是今日A股扫描数据，请生成150字以内的今日要点，"
-                    f"给出明确判断，不罗列数据：\n\n{all_data}"
-                ))],
-                tools=[],
-                system="你是一个投资分析师，输出简洁的每日要点总结。",
-            )
-            return resp.text or "摘要生成失败"
-        except Exception as e:
-            return f"摘要生成失败: {e}"
+    ANALYSIS_PROMPT = """你是 Coco 的A股投资分析师。今天是 {today}，已收盘。
+
+【任务】筛选 1-2 只当前最值得关注或操作的股票，深入分析并给出明确建议。
+
+【分析维度——每只推荐股票必须覆盖】
+1. 当前估值：PE、PB、PE历史百分位（越低越便宜）、TTM股息率，与自身历史区间对比
+2. 公司业务：做什么的，行业地位，护城河/竞争优势
+3. 财务健康：近5年ROE趋势、营收/利润增长、资产负债率、现金流状况
+4. 分红记录：是否持续分红、股息率稳定性
+5. 催化剂/风险：近期可能的驱动事件、需要警惕的因素
+6. 操作建议：买入/观望/卖出，什么价位区间合理，仓位建议
+
+【风格】
+- 先调工具拿数据，再分析，绝不要凭空编造
+- 结论要明确，不要"可能""或许""值得关注"这种废话
+- 如果某只股票数据不全，诚实说明哪些维度缺失
+- 总字数 800-1500 字"""
+
+    def _deep_analysis(self, pos_results: list, watch_results: list,
+                       disc_results: list) -> str:
+        executor = ToolExecutor(self.memory)
+
+        # 将扫描结果整理成上下文
+        all_data = json.dumps({
+            "持仓扫描": pos_results,
+            "自选监控": watch_results,
+            "市场发现": disc_results,
+        }, ensure_ascii=False, indent=2)
+
+        system = self.ANALYSIS_PROMPT.format(today=datetime.now().strftime("%Y-%m-%d"))
+        messages = [Message(role="user", text=(
+            f"今日A股扫描数据如下，请先用工具拉取关键数据，"
+            f"再从中挑选1-2只最有价值的股票做深度分析：\n\n{all_data}"
+        ))]
+
+        final_text = ""
+        for step in range(8):
+            resp = self.llm.chat(messages, READ_TOOLS, system)
+            if not resp.tool_calls:
+                final_text = resp.text or ""
+                break
+
+            results = []
+            for tc in resp.tool_calls:
+                print(f"  [分析工具] {tc.name} {tc.input}")
+                result = executor.execute(tc.name, tc.input)
+                results.append(result)
+
+            messages.append(Message(role="assistant",
+                text=resp.text, tool_calls=list(resp.tool_calls)))
+            messages.append(Message(role="user", tool_results=[
+                ToolResult(tool_call_id=tc.id, content=r)
+                for tc, r in zip(resp.tool_calls, results)
+            ]))
+        else:
+            final_text = f"[警告] 分析达到最大步数 {8}，强制终止。\n\n{resp.text or ''}"
+
+        return final_text or "分析生成失败"
 
     # ── 主入口 ────────────────────────────────
 
@@ -226,13 +266,14 @@ class DailyScanner:
         watch_results = self.scan_watchlist()
         disc_results = self.scan_discovery()
 
-        summary = self._generate_summary(pos_results, watch_results, disc_results)
-        print(f"  综合分析: {summary[:100]}...")
+        print("  启动深度分析引擎（LLM + 读工具）...")
+        analysis = self._deep_analysis(pos_results, watch_results, disc_results)
+        print(f"  分析完成: {analysis[:120]}...")
 
         # 发邮件
         try:
             send_report(
-                summary=summary,
+                summary=analysis,
                 positions=pos_results,
                 watchlist=watch_results,
                 discovery=disc_results,
