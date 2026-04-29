@@ -1,14 +1,15 @@
 # A股投资助理
 
-AI 驱动的 A 股投资助手。CLI 对话分析个股 + 定时/手机触发深度研报推送。
+AI 驱动的 A 股投资助手。CLI 对话 + Telegram 聊天机器人，支持行情分析、持仓管理、定时研报推送。
 
 **核心功能：**
-- CLI 对话：ReAct Agent + 16 个工具（行情/财务/分红/持仓管理/记忆检索）
-- PE 历史百分位：基于近 10 年财务+行情数据，判断当前 PE 在历史中的分位
-- 每日报告：15:30 自动扫描持仓/自选/市场发现，LLM 深度分析（800+ 字）
-- 手机触发：发邮件即可随时随地触发扫描，回复详尽研报
+- **Telegram Bot**：手机上跟 Agent 聊天，股票分析/持仓管理/闲聊都行，事件驱动零 CPU 空转
+- **PE 历史百分位**：基于近 10 年财务+行情数据，判断当前 PE 在历史中的分位（越低越便宜）
+- **每日报告**：15:30 自动扫描持仓/自选/市场发现，LLM 深度分析（800+ 字研报）
+- **CLI 对话**：ReAct Agent + 16 个工具（行情/财务/分红/持仓管理/记忆检索）
+- **记忆系统**：ChromaDB 向量 + SQLite FTS5 全文检索，RRF 融合，跨设备共享上下文
 
-**技术栈**：Python 3.12 · AKShare · DeepSeek · SQLite + ChromaDB FTS5 · Docker
+**技术栈**：Python 3.12 · DeepSeek · Telegram Bot API · AKShare · SQLite + ChromaDB FTS5 · Docker
 
 ---
 
@@ -17,9 +18,10 @@ AI 驱动的 A 股投资助手。CLI 对话分析个股 + 定时/手机触发深
 需要：
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - DeepSeek API Key（[申请地址](https://platform.deepseek.com/)）
-- QQ 邮箱，开启 SMTP + IMAP（QQ邮箱 → 设置 → 账户 → 开启服务 → 生成授权码）
+- QQ 邮箱，开启 SMTP（QQ邮箱 → 设置 → 账户 → 开启 SMTP 服务 → 生成授权码）
+- Telegram Bot Token（搜 [@BotFather](https://t.me/BotFather) → `/newbot` 创建）
 
-> SMTP 用于发报告，IMAP 用于接收手机触发指令。两者共用同一个授权码。
+> SMTP 用于发送每日邮件报告；Telegram Bot 用于手机聊天交互。
 
 ---
 
@@ -40,8 +42,10 @@ cd stock_agent
 DEEPSEEK_API_KEY_stock_agent=sk-xxxxxxxxxxxxxxxx
 
 MAIL_USER=你的QQ邮箱@qq.com
-MAIL_PASS=你的SMTP/IMAP授权码（16位）
+MAIL_PASS=你的SMTP授权码（16位）
 MAIL_TO=接收报告的邮箱地址
+
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
 ```
 
 > `.env` 已加入 `.gitignore`，不会被提交。
@@ -53,11 +57,26 @@ docker compose build
 docker compose up -d
 ```
 
-两个服务：`agent`（对话）和 `scheduler`（定时扫描 + 手机触发器）。
+两个服务：`agent` 和 `scheduler`（定时扫描 + Telegram Bot）。
 
 ---
 
 ## 使用
+
+### Telegram Bot（推荐日常使用）
+
+手机上打开你的 bot，直接发消息：
+
+```
+> 分析一下招商银行 600036
+> 我买了 5000 股工商银行 成本 5.2
+> 查看我的持仓
+> 最近市场有什么机会吗
+```
+
+消息发给 Agent（16 个工具全开），LLM 自己判断是调工具查数据还是闲聊。写入操作（记录决策、改持仓）会在 Agent 展示内容后问你"确认"。
+
+支持 `/reset` 清空对话历史（数据库不动）。
 
 ### CLI 对话
 
@@ -65,23 +84,7 @@ docker compose up -d
 docker compose exec -it agent python main.py
 ```
 
-示例对话：
-
-```
-> 分析一下招商银行 600036
-> 把工商银行加入持仓，成本 5.2 买了 10000 股
-> 复盘之前对中石化的分析
-```
-
-写入操作（记录决策、修改持仓等）需在 Agent 展示内容后回复 **"确认"** 才会执行。
-
-### 手机触发扫描
-
-**用 QQ 邮箱手机版给自己发邮件，主题写 `扫描`**，1-2 分钟内收到深度分析报告。
-
-不限次数，一天想扫几次扫几次。
-
-### 手动触发
+### 手动触发扫描
 
 ```bash
 docker compose exec scheduler python scheduler.py --now
@@ -89,7 +92,7 @@ docker compose exec scheduler python scheduler.py --now
 
 ### 每日定时
 
-每天 **15:30**（收盘后）自动扫描并发报告，无需任何操作。
+每天 **15:30**（收盘后）自动扫描并发邮件报告，无需任何操作。
 
 ---
 
@@ -113,13 +116,14 @@ docker compose exec scheduler python scheduler.py --now
 
 ```
 stock_agent/
-├── main.py          # CLI 入口
-├── agent.py         # ReAct Agent 核心循环
-├── tools.py         # 16 个工具（9 读 + 7 写）+ 腾讯行情
-├── adapters.py      # LLM 适配层（Claude / OpenAI / DeepSeek）
-├── memory.py        # SQLite + ChromaDB + RRF 混合检索
-├── scheduler.py     # 定时扫描 + 深度分析 + 手机触发器
-├── mailer.py        # HTML 邮件 + IMAP 监听
+├── main.py           # CLI 入口
+├── agent.py          # ReAct Agent 核心循环
+├── tools.py          # 16 个工具（9 读 + 7 写）+ 腾讯行情
+├── adapters.py       # LLM 适配层（Claude / OpenAI / DeepSeek）
+├── memory.py         # SQLite + ChromaDB + RRF 混合检索
+├── scheduler.py      # 定时扫描 + 深度分析（ReAct + 读工具）
+├── telegram_bot.py   # Telegram 聊天机器人（事件驱动长轮询）
+├── mailer.py         # HTML 邮件发送
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -127,23 +131,7 @@ stock_agent/
 
 行情数据源：腾讯 `qt.gtimg.cn`（实时）+ Tencent K-line（历史），Docker 内可用无需代理。
 
----
-
-## 切换 LLM
-
-改 `main.py` 这一行：
-
-```python
-# Claude:
-llm = ClaudeAdapter(model="claude-opus-4-5")
-
-# DeepSeek（默认）：
-llm = OpenAIAdapter(
-    model="deepseek-reasoner",
-    base_url="https://api.deepseek.com",
-    api_key=os.environ.get("DEEPSEEK_API_KEY_stock_agent"),
-)
-```
+记忆系统：每个 Telegram 用户独立 Agent 实例（独立聊天历史），底层 ChromaDB + SQLite 共享（跨设备检索历史分析洞察）。
 
 ---
 
