@@ -25,7 +25,7 @@ class DailyScanner:
     def __init__(self):
         self.memory = MemoryManager()
         self.llm = OpenAIAdapter(
-            model="deepseek-chat",
+            model="deepseek-v4-pro",
             base_url="https://api.deepseek.com",
             api_key=os.environ.get("DEEPSEEK_API_KEY_stock_agent"),
         )

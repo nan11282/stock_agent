@@ -14,7 +14,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
 # LLM 适配器——和 main.py 同一套
 _llm = OpenAIAdapter(
-    model="deepseek-chat",
+    model="deepseek-v4-pro",
     base_url="https://api.deepseek.com",
     api_key=os.environ.get("DEEPSEEK_API_KEY_stock_agent"),
 )

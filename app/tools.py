@@ -7,6 +7,7 @@ WRITE tools (7) : 必须用户明确指令 + 展示内容 + 等待"确认"后才
 
 import json
 from memory import MemoryManager
+from metrics import get_tracer
 
 
 # ─────────────────────────────────────────────
@@ -293,39 +294,55 @@ class ToolExecutor:
         self.memory = memory
 
     def execute(self, tool_name: str, tool_input: dict) -> str:
-        try:
-            handler = getattr(self, f"_tool_{tool_name}", None)
-            if handler is None:
-                return json.dumps({"error": f"未知工具: {tool_name}"}, ensure_ascii=False)
-            result = handler(**tool_input)
-            return json.dumps(result, ensure_ascii=False, indent=2)
-        except Exception as e:
-            return json.dumps({"error": str(e), "tool": tool_name}, ensure_ascii=False)
+        with get_tracer().tool_call(tool_name, tool_input) as rec:
+            try:
+                handler = getattr(self, f"_tool_{tool_name}", None)
+                if handler is None:
+                    out = json.dumps(
+                        {"error": f"未知工具: {tool_name}"}, ensure_ascii=False
+                    )
+                else:
+                    result = handler(**tool_input)
+                    out = json.dumps(result, ensure_ascii=False, indent=2)
+            except Exception as e:
+                out = json.dumps(
+                    {"error": str(e), "tool": tool_name}, ensure_ascii=False
+                )
+                rec.error = str(e)
+            rec.result_chars = len(out)
+            return out
 
     # ── PE 历史百分位计算（内部复用）────────────
 
     @staticmethod
-    def _compute_pe_percentile(stock_code: str, current_pe: float) -> dict:
-        """计算当前 PE 在近 10 年历史中的分位。返回 pe_percentile_pct 等字段。"""
-        import akshare as ak
+    def _compute_pe_percentile(stock_code: str, current_pe: float,
+                               fin_df=None, price_df=None) -> dict:
+        """计算当前 PE 在近 10 年历史中的分位。返回 pe_percentile_pct 等字段。
+
+        测试时可直接传入 fin_df / price_df，跳过 akshare 调用。
+        """
         import pandas as pd
 
         try:
             # 年度财务数据（EPS）
-            fin_df = ak.stock_financial_abstract_ths(
-                symbol=stock_code, indicator="按年度"
-            )
+            if fin_df is None:
+                import akshare as ak
+                fin_df = ak.stock_financial_abstract_ths(
+                    symbol=stock_code, indicator="按年度"
+                )
             if fin_df.empty or "基本每股收益" not in fin_df.columns:
                 return {"pe_percentile_pct": None, "pe_percentile_note": "无财务EPS数据"}
 
             # 10年日K线（腾讯源，Docker 内可用）
-            end_date = pd.Timestamp.now().strftime("%Y%m%d")
-            start_date = (pd.Timestamp.now() - pd.DateOffset(years=10)).strftime("%Y%m%d")
-            prefix = exchange_prefix(stock_code)
-            price_df = ak.stock_zh_a_hist_tx(
-                symbol=f"{prefix}{stock_code}", start_date=start_date,
-                end_date=end_date, adjust="qfq",
-            )
+            if price_df is None:
+                import akshare as ak
+                end_date = pd.Timestamp.now().strftime("%Y%m%d")
+                start_date = (pd.Timestamp.now() - pd.DateOffset(years=10)).strftime("%Y%m%d")
+                prefix = exchange_prefix(stock_code)
+                price_df = ak.stock_zh_a_hist_tx(
+                    symbol=f"{prefix}{stock_code}", start_date=start_date,
+                    end_date=end_date, adjust="qfq",
+                )
             if price_df.empty:
                 return {"pe_percentile_pct": None, "pe_percentile_note": "无历史价格数据"}
 

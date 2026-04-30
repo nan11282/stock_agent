@@ -20,7 +20,7 @@ def main():
     # llm = ClaudeAdapter(model="claude-opus-4-5")
     # llm = OpenAIAdapter(model="gpt-4o")
     llm = OpenAIAdapter(
-        model="deepseek-reasoner",
+        model="deepseek-v4-pro",
         base_url="https://api.deepseek.com",
         api_key=os.environ.get("DEEPSEEK_API_KEY_stock_agent"),
     )

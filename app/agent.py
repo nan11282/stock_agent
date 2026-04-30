@@ -5,6 +5,7 @@ agent.py -- Agent 核心循环
 from adapters import LLMAdapter, LLMResponse, Message, ToolResult
 from tools import ToolExecutor, ALL_TOOLS
 from memory import MemoryManager
+from metrics import get_tracer
 
 
 SYSTEM_PROMPT_TEMPLATE = """
@@ -96,6 +97,7 @@ class Agent:
             role="assistant",
             text=response.text,
             tool_calls=list(response.tool_calls),
+            reasoning_content=response.reasoning_content,
         ))
 
     def _append_tool_results(self, tool_calls, results: list[str]):
@@ -129,39 +131,49 @@ class Agent:
                     text=resp.text,
                     metadata={"source_query": user_input[:100]},
                 )
+                get_tracer().bump_memory_writes()
         except Exception as e:
             print(f"  [记忆写入失败] {e}")
 
     # ── 主循环 ───────────────────────────────
 
     def chat(self, user_input: str) -> str:
-        self._append_user(user_input)
-        system = self._build_system_prompt(user_input)
+        tracer = get_tracer()
 
-        steps = 0
-        final_text = ""
+        with tracer.turn(user_input, self.history):
+            self._append_user(user_input)
+            system = self._build_system_prompt(user_input)
+            tracer.set_system_prompt(system)
 
-        while steps < self.max_steps:
-            steps += 1
-            response = self.llm.chat(self.history, ALL_TOOLS, system)
-            self._append_assistant(response)
+            steps = 0
+            final_text = ""
 
-            if not response.tool_calls:
-                final_text = response.text or ""
-                break
+            while steps < self.max_steps:
+                steps += 1
+                with tracer.llm_call(system, self.history) as llm_rec:
+                    response = self.llm.chat(self.history, ALL_TOOLS, system)
+                    llm_rec.output_text_chars = len(response.text or "")
+                    llm_rec.tool_calls_emitted = len(response.tool_calls)
 
-            results = []
-            for tc in response.tool_calls:
-                print(f"  [工具调用] {tc.name}  参数={tc.input}")
-                result = self.executor.execute(tc.name, tc.input)
-                results.append(result)
+                self._append_assistant(response)
 
-            self._append_tool_results(response.tool_calls, results)
+                if not response.tool_calls:
+                    final_text = response.text or ""
+                    break
 
-        else:
-            final_text = f"[警告] 达到最大步数 {self.max_steps}，强制终止。"
+                results = []
+                for tc in response.tool_calls:
+                    print(f"  [工具调用] {tc.name}  参数={tc.input}")
+                    result = self.executor.execute(tc.name, tc.input)
+                    results.append(result)
 
-        self._save_conversation_insight(user_input, final_text)
+                self._append_tool_results(response.tool_calls, results)
+
+            else:
+                final_text = f"[警告] 达到最大步数 {self.max_steps}，强制终止。"
+
+            tracer.set_history_end(self.history, final_text)
+            self._save_conversation_insight(user_input, final_text)
 
         return final_text
 

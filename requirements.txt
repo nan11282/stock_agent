@@ -6,3 +6,6 @@ jieba
 akshare
 schedule
 python-telegram-bot
+
+# 测试
+pytest

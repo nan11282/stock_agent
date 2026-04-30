@@ -37,6 +37,7 @@ class Message:
     text: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_results: list[ToolResult] = field(default_factory=list)
+    reasoning_content: str | None = None  # DeepSeek V4 推理链
 
 
 @dataclass
@@ -44,6 +45,7 @@ class LLMResponse:
     text: str | None
     tool_calls: list[ToolCall] = field(default_factory=list)
     stop_reason: str = "end_turn"
+    reasoning_content: str | None = None
 
 
 # ─────────────────────────────────────────────
@@ -150,6 +152,8 @@ class OpenAIAdapter(LLMAdapter):
                     out.append({"role": "user", "content": m.text or ""})
             elif m.role == "assistant":
                 msg: dict = {"role": "assistant", "content": m.text or None}
+                if m.reasoning_content:
+                    msg["reasoning_content"] = m.reasoning_content
                 if m.tool_calls:
                     msg["tool_calls"] = [
                         {
@@ -194,10 +198,14 @@ class OpenAIAdapter(LLMAdapter):
                     input=json.loads(tc.function.arguments),
                 ))
 
+        # DeepSeek V4 推理链
+        reasoning = getattr(msg, "reasoning_content", None)
+
         return LLMResponse(
             text=msg.content,
             tool_calls=tool_calls,
             stop_reason="tool_use" if tool_calls else "end_turn",
+            reasoning_content=reasoning,
         )
 
 

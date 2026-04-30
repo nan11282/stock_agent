@@ -20,7 +20,7 @@ services:
 
   scheduler:
     build: .
-    command: [ "python", "scheduler.py" ]
+    command: [ "python", "app/scheduler.py" ]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:

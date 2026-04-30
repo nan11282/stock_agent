@@ -352,6 +352,19 @@ class EpisodicMemory:
         self.conn.commit()
         return doc_id
 
+    # ── RRF 融合（纯数学，可独立单测）─────────
+
+    @staticmethod
+    def _rrf_fuse(vec_ids: list[str], fts_ids: list[str],
+                  k: int = 60, top_k: int = 4) -> list[str]:
+        """Reciprocal Rank Fusion: 同一 doc_id 在两路中名次越靠前得分越高。"""
+        scores: dict[str, float] = {}
+        for rank, doc_id in enumerate(vec_ids):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+        for rank, doc_id in enumerate(fts_ids):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+        return sorted(scores, key=lambda x: scores[x], reverse=True)[:top_k]
+
     # ── 混合检索主入口 ──────────────────────────
 
     def retrieve(self, query: str, n_results: int = 8, top_k: int = 4) -> list[dict]:
@@ -380,17 +393,7 @@ class EpisodicMemory:
             pass  # FTS 查询失败不影响向量检索结果
 
         # ── 路3：RRF 融合（K=60）──
-        K = 60
-        rrf_scores: dict[str, float] = {}
-
-        for rank, doc_id in enumerate(vec_ids):
-            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0 / (K + rank + 1)
-
-        for rank, doc_id in enumerate(fts_ids):
-            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0 / (K + rank + 1)
-
-        # ── 取 top-k ──
-        top_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)[:top_k]
+        top_ids = self._rrf_fuse(vec_ids, fts_ids, k=60, top_k=top_k)
         if not top_ids:
             return []
 
