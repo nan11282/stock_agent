@@ -232,6 +232,32 @@ def set_tracer(tracer: Tracer):
 
 
 # ─────────────────────────────────────────────
+# Console Timing
+# ─────────────────────────────────────────────
+
+def timing_log_enabled() -> bool:
+    return os.environ.get("TIMING_LOG_ENABLED", "1").lower() not in (
+        "0", "false", "no", "off"
+    )
+
+
+@contextlib.contextmanager
+def console_timer(stage: str, detail: str = ""):
+    """Print elapsed time to Docker stdout for live bottleneck inspection."""
+    if not timing_log_enabled():
+        yield
+        return
+
+    label = f"{stage} {detail}".strip()
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"  [耗时] {label}: {elapsed_ms:.0f} ms", flush=True)
+
+
+# ─────────────────────────────────────────────
 # CLI: 汇总 jsonl
 # ─────────────────────────────────────────────
 

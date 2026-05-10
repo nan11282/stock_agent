@@ -7,28 +7,30 @@ scheduler.py -- 定时扫描 + 邮件
 
 import argparse
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import schedule
 import time
 
-import os
-
-from adapters import OpenAIAdapter, Message, ToolResult
+from adapters import Message, ToolResult
 from memory import MemoryManager
 from mailer import send_report
 from tools import fetch_tencent_quote, READ_TOOLS, ToolExecutor
 from telegram_bot import start_bot
+from runtime import build_default_llm
+from metrics import console_timer
+
+
+def _read_tool_max_workers(n: int) -> int:
+    return min(max(1, int(os.environ.get("READ_TOOL_MAX_WORKERS", "5"))), n)
 
 
 class DailyScanner:
     def __init__(self):
         self.memory = MemoryManager()
-        self.llm = OpenAIAdapter(
-            model="deepseek-v4-pro",
-            base_url="https://api.deepseek.com",
-            api_key=os.environ.get("DEEPSEEK_API_KEY_stock_agent"),
-        )
+        self.llm = build_default_llm()
 
     # ── 第一层：持仓扫描 ─────────────────────
 
@@ -236,19 +238,30 @@ class DailyScanner:
 
         final_text = ""
         for step in range(8):
-            resp = self.llm.chat(messages, READ_TOOLS, system)
+            with console_timer("scheduler", f"LLM step={step + 1}"):
+                resp = self.llm.chat(messages, READ_TOOLS, system)
             if not resp.tool_calls:
                 final_text = resp.text or ""
                 break
 
-            results = []
-            for tc in resp.tool_calls:
+            def run_tool(tc):
                 print(f"  [分析工具] {tc.name} {tc.input}")
-                result = executor.execute(tc.name, tc.input)
-                results.append(result)
+                with console_timer("scheduler", f"tool {tc.name}"):
+                    return executor.execute(tc.name, tc.input)
+
+            if len(resp.tool_calls) <= 1:
+                results = [run_tool(tc) for tc in resp.tool_calls]
+            else:
+                workers = _read_tool_max_workers(len(resp.tool_calls))
+                with console_timer("scheduler", f"parallel read tools n={len(resp.tool_calls)} workers={workers}"):
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        results = list(pool.map(run_tool, resp.tool_calls))
 
             messages.append(Message(role="assistant",
-                text=resp.text, tool_calls=list(resp.tool_calls)))
+                text=resp.text,
+                tool_calls=list(resp.tool_calls),
+                reasoning_content=resp.reasoning_content,
+            ))
             messages.append(Message(role="user", tool_results=[
                 ToolResult(tool_call_id=tc.id, content=r)
                 for tc, r in zip(resp.tool_calls, results)
@@ -263,29 +276,35 @@ class DailyScanner:
     def run(self):
         print(f"[{datetime.now().isoformat()}] 开始每日扫描...")
 
-        pos_results = self.scan_positions()
-        watch_results = self.scan_watchlist()
-        disc_results = self.scan_discovery()
+        with console_timer("每日扫描", "持仓扫描"):
+            pos_results = self.scan_positions()
+        with console_timer("每日扫描", "自选监控"):
+            watch_results = self.scan_watchlist()
+        with console_timer("每日扫描", "市场发现"):
+            disc_results = self.scan_discovery()
 
         print("  启动深度分析引擎（LLM + 读工具）...")
-        analysis = self._deep_analysis(pos_results, watch_results, disc_results)
+        with console_timer("每日扫描", "LLM深度分析"):
+            analysis = self._deep_analysis(pos_results, watch_results, disc_results)
         print(f"  分析完成: {analysis[:120]}...")
 
         # 发邮件
         try:
-            send_report(
-                summary=analysis,
-                positions=pos_results,
-                watchlist=watch_results,
-                discovery=disc_results,
-            )
+            with console_timer("每日扫描", "邮件发送"):
+                send_report(
+                    summary=analysis,
+                    positions=pos_results,
+                    watchlist=watch_results,
+                    discovery=disc_results,
+                )
             print("  邮件发送成功")
         except Exception as e:
             print(f"  邮件发送失败: {e}")
 
         # 结果写入 scan_results 表
-        for item in pos_results + watch_results + disc_results:
-            self.memory.decisions.save_scan_result(item)
+        with console_timer("每日扫描", "scan_results写入"):
+            for item in pos_results + watch_results + disc_results:
+                self.memory.decisions.save_scan_result(item)
 
         print(f"[{datetime.now().isoformat()}] 扫描完成")
 

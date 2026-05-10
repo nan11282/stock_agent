@@ -26,6 +26,13 @@ def test_no_part_exceeds_limit_even_under_pressure():
         assert len(p) <= 500
 
 
+def test_single_long_paragraph_is_chunked():
+    msg = "x" * 1200
+    parts = _split_long_message(msg, limit=500)
+    assert len(parts) == 3
+    assert all(len(p) <= 500 for p in parts)
+
+
 def test_empty_input_returns_empty_or_safe():
     parts = _split_long_message("", limit=4000)
     # 当前实现返回 [""[:4000]] = [""]，不应崩溃

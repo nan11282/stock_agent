@@ -3,6 +3,7 @@ openai
 chromadb
 pysqlite3-binary
 jieba
+sentence-transformers
 akshare
 schedule
 python-telegram-bot

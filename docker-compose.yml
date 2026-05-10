@@ -10,12 +10,17 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - DB_PATH=/app/data/investment.db
       - CHROMA_PATH=/app/chroma_db
+      - HF_HOME=/root/.cache/huggingface
+      - RERANK_ENABLED=${RERANK_ENABLED:-1}
+      - RERANK_MODEL=${RERANK_MODEL:-BAAI/bge-reranker-base}
+      - RERANK_POOL_SIZE=${RERANK_POOL_SIZE:-12}
       - HTTP_PROXY=http://host.docker.internal:7890
       - HTTPS_PROXY=http://host.docker.internal:7890
       - NO_PROXY=localhost,127.0.0.1
     volumes:
       - ./data:/app/data
       - ./chroma_db:/app/chroma_db
+      - ./model_cache:/root/.cache/huggingface
       - .:/app                       # 代码热挂载：改完直接重跑，无需 rebuild
 
   scheduler:
@@ -28,6 +33,10 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - DB_PATH=/app/data/investment.db
       - CHROMA_PATH=/app/chroma_db
+      - HF_HOME=/root/.cache/huggingface
+      - RERANK_ENABLED=${RERANK_ENABLED:-1}
+      - RERANK_MODEL=${RERANK_MODEL:-BAAI/bge-reranker-base}
+      - RERANK_POOL_SIZE=${RERANK_POOL_SIZE:-12}
       - MAIL_HOST=${MAIL_HOST:-smtp.qq.com}
       - MAIL_PORT=${MAIL_PORT:-465}
       - MAIL_USER=${MAIL_USER}
@@ -42,5 +51,6 @@ services:
     volumes:
       - ./data:/app/data
       - ./chroma_db:/app/chroma_db
+      - ./model_cache:/root/.cache/huggingface
       - .:/app
     restart: unless-stopped

@@ -20,10 +20,14 @@ import json
 import uuid
 from datetime import datetime
 
+from metrics import console_timer
+
 
 # ── 路径配置 ──────────────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "./data/investment.db")
 CHROMA_PATH = os.environ.get("CHROMA_PATH", "./chroma_db")
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-base")
+RERANK_POOL_SIZE = int(os.environ.get("RERANK_POOL_SIZE", "12"))
 
 
 # ─────────────────────────────────────────────
@@ -294,6 +298,9 @@ class EpisodicMemory:
       两者通过 doc_id 关联，写入时同步，检索时独立查询后 RRF 融合
     """
 
+    _cross_encoder = None
+    _cross_encoder_error: str | None = None
+
     def __init__(self, db_path: str = None, persist_dir: str = None):
         import chromadb
 
@@ -329,27 +336,30 @@ class EpisodicMemory:
         meta = {**(metadata or {}), "saved_at": now}
 
         # 1. 写入 ChromaDB（自动生成 embedding 向量）
-        self.collection.add(
-            documents=[text],
-            metadatas=[meta],
-            ids=[doc_id],
-        )
+        with console_timer("记忆写入", "ChromaDB add"):
+            self.collection.add(
+                documents=[text],
+                metadatas=[meta],
+                ids=[doc_id],
+            )
 
         # 2. 写入 SQLite episodic_docs 表
-        self.conn.execute("""
-            INSERT INTO episodic_docs (doc_id, text, metadata, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (doc_id, text, json.dumps(meta, ensure_ascii=False), now))
+        with console_timer("记忆写入", "SQLite episodic_docs"):
+            self.conn.execute("""
+                INSERT INTO episodic_docs (doc_id, text, metadata, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (doc_id, text, json.dumps(meta, ensure_ascii=False), now))
 
         # 3. 更新 FTS5 索引（存分词后的文本，便于中文检索）
         rowid = self.conn.execute(
             "SELECT id FROM episodic_docs WHERE doc_id=?", (doc_id,)
         ).fetchone()[0]
-        self.conn.execute(
-            "INSERT INTO episodic_fts(rowid, text, doc_id) VALUES (?, ?, ?)",
-            (rowid, self._tokenize(text), doc_id),
-        )
-        self.conn.commit()
+        with console_timer("记忆写入", "FTS5 index"):
+            self.conn.execute(
+                "INSERT INTO episodic_fts(rowid, text, doc_id) VALUES (?, ?, ?)",
+                (rowid, self._tokenize(text), doc_id),
+            )
+            self.conn.commit()
         return doc_id
 
     # ── RRF 融合（纯数学，可独立单测）─────────
@@ -358,57 +368,196 @@ class EpisodicMemory:
     def _rrf_fuse(vec_ids: list[str], fts_ids: list[str],
                   k: int = 60, top_k: int = 4) -> list[str]:
         """Reciprocal Rank Fusion: 同一 doc_id 在两路中名次越靠前得分越高。"""
+        scores = EpisodicMemory._rrf_score_map(vec_ids, fts_ids, k=k)
+        return sorted(scores, key=lambda x: scores[x], reverse=True)[:top_k]
+
+    @staticmethod
+    def _rrf_score_map(vec_ids: list[str], fts_ids: list[str],
+                       k: int = 60) -> dict[str, float]:
         scores: dict[str, float] = {}
         for rank, doc_id in enumerate(vec_ids):
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
         for rank, doc_id in enumerate(fts_ids):
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
-        return sorted(scores, key=lambda x: scores[x], reverse=True)[:top_k]
+        return scores
+
+    @staticmethod
+    def _token_set(text: str) -> set[str]:
+        import re
+
+        tokenized = EpisodicMemory._tokenize(text or "").lower()
+        tokens = {t for t in tokenized.split() if t}
+        tokens.update(re.findall(r"[a-z0-9]+", (text or "").lower()))
+        return tokens
+
+    @staticmethod
+    def _rerank_candidates(query: str, candidates: list[dict],
+                           top_k: int = 4) -> list[dict]:
+        if os.environ.get("RERANK_ENABLED", "").lower() in ("1", "true", "yes", "on"):
+            return EpisodicMemory._model_rerank_candidates(query, candidates, top_k)
+        return EpisodicMemory._lexical_rerank_candidates(query, candidates, top_k)
+
+    @staticmethod
+    def _load_cross_encoder():
+        if EpisodicMemory._cross_encoder is not None:
+            return EpisodicMemory._cross_encoder
+        if EpisodicMemory._cross_encoder_error:
+            return None
+
+        try:
+            from sentence_transformers import CrossEncoder
+
+            with console_timer("记忆检索", f"加载rerank模型 {RERANK_MODEL}"):
+                EpisodicMemory._cross_encoder = CrossEncoder(RERANK_MODEL)
+            return EpisodicMemory._cross_encoder
+        except Exception as e:
+            EpisodicMemory._cross_encoder_error = str(e)
+            print(f"  [rerank] 模型加载失败，降级到轻量rerank: {e}", flush=True)
+            return None
+
+    @staticmethod
+    def _model_rerank_candidates(query: str, candidates: list[dict],
+                                 top_k: int = 4) -> list[dict]:
+        model = EpisodicMemory._load_cross_encoder()
+        if model is None:
+            return EpisodicMemory._lexical_rerank_candidates(query, candidates, top_k)
+        if not candidates:
+            return []
+
+        try:
+            pairs = [(query or "", c.get("text") or "") for c in candidates]
+            with console_timer("记忆检索", f"模型rerank model={RERANK_MODEL} pool={len(candidates)} top_k={top_k}"):
+                model_scores = model.predict(pairs)
+
+            reranked = []
+            for idx, (candidate, score) in enumerate(zip(candidates, model_scores)):
+                reranked.append({
+                    **candidate,
+                    "rerank_score": round(float(score), 6),
+                    "rerank_provider": "model",
+                    "rerank_model": RERANK_MODEL,
+                    "_original_rank": idx,
+                })
+
+            reranked.sort(
+                key=lambda x: (x["rerank_score"], x["rrf_score"], -x["_original_rank"]),
+                reverse=True,
+            )
+            return [
+                {k: v for k, v in item.items() if k != "_original_rank"}
+                for item in reranked[:top_k]
+            ]
+        except Exception as e:
+            print(f"  [rerank] 模型推理失败，降级到轻量rerank: {e}", flush=True)
+            return EpisodicMemory._lexical_rerank_candidates(query, candidates, top_k)
+
+    @staticmethod
+    def _lexical_rerank_candidates(query: str, candidates: list[dict],
+                                   top_k: int = 4) -> list[dict]:
+        """Rerank RRF candidates by direct query/document lexical fit.
+
+        RRF remains the prior, so when lexical evidence is weak the original
+        vector+FTS rank stays stable. This keeps reranking deterministic and
+        avoids introducing another model dependency in Docker.
+        """
+        query_tokens = EpisodicMemory._token_set(query)
+        query_lower = (query or "").strip().lower()
+        if not candidates:
+            return []
+
+        max_rrf = max((c["rrf_score"] for c in candidates), default=0.0) or 1.0
+        reranked = []
+        for idx, c in enumerate(candidates):
+            text = c.get("text") or ""
+            doc_tokens = EpisodicMemory._token_set(text)
+            if query_tokens:
+                lexical_score = len(query_tokens & doc_tokens) / len(query_tokens)
+            else:
+                lexical_score = 0.0
+            if query_lower and query_lower in text.lower():
+                lexical_score = min(1.0, lexical_score + 0.25)
+
+            rrf_score = c["rrf_score"] / max_rrf
+            rerank_score = 0.70 * rrf_score + 0.30 * lexical_score
+            reranked.append({
+                **c,
+                "rerank_score": round(rerank_score, 6),
+                "rerank_provider": "lexical",
+                "_original_rank": idx,
+            })
+
+        reranked.sort(
+            key=lambda x: (x["rerank_score"], x["rrf_score"], -x["_original_rank"]),
+            reverse=True,
+        )
+        return [
+            {k: v for k, v in item.items() if k != "_original_rank"}
+            for item in reranked[:top_k]
+        ]
 
     # ── 混合检索主入口 ──────────────────────────
 
     def retrieve(self, query: str, n_results: int = 8, top_k: int = 4) -> list[dict]:
-        if self.collection.count() == 0:
+        with console_timer("记忆检索", "ChromaDB count"):
+            collection_count = self.collection.count()
+        if collection_count == 0:
             return []
 
-        n = min(n_results, self.collection.count())
+        n = min(n_results, collection_count)
 
         # ── 路1：ChromaDB 向量检索（HNSW 近似最近邻，语义感知）──
-        vec_result = self.collection.query(query_texts=[query], n_results=n)
+        with console_timer("记忆检索", f"向量库 query n={n}"):
+            vec_result = self.collection.query(query_texts=[query], n_results=n)
         vec_ids: list[str] = vec_result["ids"][0]
 
         # ── 路2：SQLite FTS5 全文检索（精确词匹配，对股票代码/数字敏感）──
         fts_ids: list[str] = []
-        try:
-            tokenized_query = self._tokenize(query)
-            # 用 OR 连接各 token，提高中文召回率
-            match_expr = " OR ".join(tokenized_query.split())
-            if match_expr.strip():
-                rows = self.conn.execute(
-                    "SELECT doc_id, rank FROM episodic_fts WHERE text MATCH ? ORDER BY rank LIMIT ?",
-                    (match_expr, n),
-                ).fetchall()
-                fts_ids = [row["doc_id"] for row in rows]
-        except Exception:
-            pass  # FTS 查询失败不影响向量检索结果
+        with console_timer("记忆检索", "FTS5 query"):
+            try:
+                tokenized_query = self._tokenize(query)
+                # 用 OR 连接各 token，提高中文召回率
+                match_expr = " OR ".join(tokenized_query.split())
+                if match_expr.strip():
+                    rows = self.conn.execute(
+                        "SELECT doc_id, rank FROM episodic_fts WHERE text MATCH ? ORDER BY rank LIMIT ?",
+                        (match_expr, n),
+                    ).fetchall()
+                    fts_ids = [row["doc_id"] for row in rows]
+            except Exception:
+                pass  # FTS 查询失败不影响向量检索结果
 
         # ── 路3：RRF 融合（K=60）──
-        top_ids = self._rrf_fuse(vec_ids, fts_ids, k=60, top_k=top_k)
-        if not top_ids:
+        with console_timer("记忆检索", f"RRF fuse vec={len(vec_ids)} fts={len(fts_ids)}"):
+            scores = self._rrf_score_map(vec_ids, fts_ids, k=60)
+            rerank_pool_ids = sorted(scores, key=lambda x: scores[x], reverse=True)[
+                :min(len(scores), max(RERANK_POOL_SIZE, top_k))
+            ]
+        if not rerank_pool_ids:
             return []
 
-        fetched = self.collection.get(ids=top_ids, include=["documents", "metadatas"])
-
-        return [
-            {
-                "text": doc,
-                "metadata": meta,
-                "rrf_score": round(rrf_scores[id_], 6),
-            }
+        with console_timer("记忆检索", f"ChromaDB get rerank_pool={len(rerank_pool_ids)}"):
+            fetched = self.collection.get(ids=rerank_pool_ids, include=["documents", "metadatas"])
+        fetched_map = {
+            id_: (doc, meta)
             for id_, doc, meta in zip(
-                fetched["ids"], fetched["documents"], fetched["metadatas"]
+                fetched.get("ids", []),
+                fetched.get("documents", []),
+                fetched.get("metadatas", []),
             )
+        }
+
+        candidates = [
+            {
+                "text": fetched_map[id_][0],
+                "metadata": fetched_map[id_][1],
+                "rrf_score": round(scores[id_], 6),
+            }
+            for id_ in rerank_pool_ids
+            if id_ in fetched_map
         ]
+
+        with console_timer("记忆检索", f"rerank pool={len(candidates)} top_k={top_k}"):
+            return self._rerank_candidates(query, candidates, top_k=top_k)
 
 
 # ─────────────────────────────────────────────
@@ -421,8 +570,10 @@ class MemoryManager:
         self.episodic = EpisodicMemory()
 
     def retrieve_context(self, user_query: str) -> str:
-        fragments = self.episodic.retrieve(user_query, n_results=8, top_k=4)
-        decision_hits = self.decisions.search_decisions(keyword=user_query, limit=3)
+        with console_timer("上下文构建", "episodic hybrid retrieve"):
+            fragments = self.episodic.retrieve(user_query, n_results=8, top_k=4)
+        with console_timer("上下文构建", "SQLite decisions search"):
+            decision_hits = self.decisions.search_decisions(keyword=user_query, limit=3)
 
         parts = []
 

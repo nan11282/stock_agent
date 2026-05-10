@@ -100,3 +100,34 @@ def test_empty_price_df():
         fin_df=_fin_df(eps_pairs), price_df=pd.DataFrame(),
     )
     assert result["pe_percentile_pct"] is None
+
+
+def test_cached_pe_history_recomputes_percentile_for_current_pe(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "investment.db"))
+    pe_info = {
+        "pe_percentile_pct": 0.0,
+        "pe_percentile_years": 4,
+        "pe_percentile_lo": 10.0,
+        "pe_percentile_hi": 40.0,
+        "pe_history": [10.0, 20.0, 30.0, 40.0],
+    }
+
+    ToolExecutor._init_pe_cache()
+    ToolExecutor._save_cached_pe_history("600028", pe_info)
+    cached = ToolExecutor._load_cached_pe_percentile("600028", current_pe=35.0)
+
+    assert cached["pe_percentile_cached"] is True
+    assert cached["pe_percentile_pct"] == 75.0
+
+
+def test_compact_pe_percentile_removes_history_payload():
+    compact = ToolExecutor._compact_pe_percentile({
+        "pe_percentile_pct": 50.0,
+        "pe_percentile_years": 3,
+        "pe_percentile_lo": 8.0,
+        "pe_percentile_hi": 16.0,
+        "pe_history": [8.0, 12.0, 16.0],
+    })
+
+    assert "pe_history" not in compact
+    assert compact["pe_percentile_range"] == {"low": 8.0, "high": 16.0, "years": 3}

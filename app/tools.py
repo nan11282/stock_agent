@@ -6,8 +6,13 @@ WRITE tools (7) : 必须用户明确指令 + 展示内容 + 等待"确认"后才
 """
 
 import json
-from memory import MemoryManager
-from metrics import get_tracer
+import os
+import sqlite3
+import threading
+from datetime import date, datetime
+
+from memory import DB_PATH, MemoryManager
+from metrics import console_timer, get_tracer
 
 
 # ─────────────────────────────────────────────
@@ -255,6 +260,7 @@ WRITE_TOOLS = [
 ]
 
 ALL_TOOLS = READ_TOOLS + WRITE_TOOLS
+WRITE_TOOL_NAMES = {tool["name"] for tool in WRITE_TOOLS}
 
 
 # ─────────────────────────────────────────────
@@ -290,29 +296,163 @@ def fetch_tencent_quote(stock_code: str) -> dict:
 
 
 class ToolExecutor:
+    _pe_cache_lock = threading.Lock()
+
     def __init__(self, memory: MemoryManager):
         self.memory = memory
+        self._init_pe_cache()
 
-    def execute(self, tool_name: str, tool_input: dict) -> str:
+    def execute(self, tool_name: str, tool_input: dict,
+                allow_write: bool = False) -> str:
         with get_tracer().tool_call(tool_name, tool_input) as rec:
-            try:
-                handler = getattr(self, f"_tool_{tool_name}", None)
-                if handler is None:
+            with console_timer("工具执行", f"{tool_name} input={tool_input}"):
+                try:
+                    if tool_name in WRITE_TOOL_NAMES and not allow_write:
+                        out = json.dumps({
+                            "error": "写工具需要用户确认后才能执行",
+                            "tool": tool_name,
+                            "requires_confirmation": True,
+                        }, ensure_ascii=False)
+                        rec.error = "requires_confirmation"
+                        rec.result_chars = len(out)
+                        return out
+
+                    handler = getattr(self, f"_tool_{tool_name}", None)
+                    if handler is None:
+                        out = json.dumps(
+                            {"error": f"未知工具: {tool_name}"}, ensure_ascii=False
+                        )
+                    else:
+                        result = handler(**tool_input)
+                        out = json.dumps(result, ensure_ascii=False, indent=2)
+                except Exception as e:
                     out = json.dumps(
-                        {"error": f"未知工具: {tool_name}"}, ensure_ascii=False
+                        {"error": str(e), "tool": tool_name}, ensure_ascii=False
                     )
-                else:
-                    result = handler(**tool_input)
-                    out = json.dumps(result, ensure_ascii=False, indent=2)
-            except Exception as e:
-                out = json.dumps(
-                    {"error": str(e), "tool": tool_name}, ensure_ascii=False
-                )
-                rec.error = str(e)
-            rec.result_chars = len(out)
-            return out
+                    rec.error = str(e)
+                rec.result_chars = len(out)
+                return out
 
     # ── PE 历史百分位计算（内部复用）────────────
+
+    @staticmethod
+    def _pe_cache_db_path() -> str:
+        return os.environ.get("DB_PATH", DB_PATH)
+
+    @classmethod
+    def _init_pe_cache(cls):
+        db_path = cls._pe_cache_db_path()
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        with cls._pe_cache_lock:
+            conn = sqlite3.connect(db_path, timeout=30)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS pe_percentile_cache (
+                        stock_code           TEXT PRIMARY KEY,
+                        trade_date           TEXT NOT NULL,
+                        pe_history           TEXT NOT NULL,
+                        pe_percentile_years  INTEGER NOT NULL,
+                        pe_percentile_lo     REAL NOT NULL,
+                        pe_percentile_hi     REAL NOT NULL,
+                        updated_at           TEXT NOT NULL
+                    )
+                """)
+                conn.commit()
+            finally:
+                conn.close()
+
+    @staticmethod
+    def _percentile_from_history(current_pe: float, historical_pes: list[float]) -> dict:
+        count_below = sum(1 for pe in historical_pes if pe < current_pe)
+        percentile = round(count_below / len(historical_pes) * 100, 1)
+        return {
+            "pe_percentile_pct":   percentile,
+            "pe_percentile_years": len(historical_pes),
+            "pe_percentile_lo":    round(min(historical_pes), 1),
+            "pe_percentile_hi":    round(max(historical_pes), 1),
+            "pe_history":          sorted(historical_pes),
+        }
+
+    @classmethod
+    def _load_cached_pe_percentile(cls, stock_code: str, current_pe: float) -> dict | None:
+        today = date.today().isoformat()
+        with cls._pe_cache_lock:
+            conn = sqlite3.connect(cls._pe_cache_db_path(), timeout=30)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    """
+                    SELECT pe_history FROM pe_percentile_cache
+                    WHERE stock_code = ? AND trade_date = ?
+                    """,
+                    (stock_code, today),
+                ).fetchone()
+            finally:
+                conn.close()
+
+        if row is None:
+            return None
+
+        try:
+            historical_pes = json.loads(row["pe_history"])
+            if len(historical_pes) < 3:
+                return None
+            result = cls._percentile_from_history(current_pe, historical_pes)
+            result["pe_percentile_cached"] = True
+            return result
+        except Exception:
+            return None
+
+    @classmethod
+    def _save_cached_pe_history(cls, stock_code: str, pe_info: dict):
+        historical_pes = pe_info.get("pe_history")
+        if not historical_pes or len(historical_pes) < 3:
+            return
+
+        now = datetime.now().isoformat(timespec="seconds")
+        today = date.today().isoformat()
+        with cls._pe_cache_lock:
+            conn = sqlite3.connect(cls._pe_cache_db_path(), timeout=30)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO pe_percentile_cache (
+                        stock_code, trade_date, pe_history, pe_percentile_years,
+                        pe_percentile_lo, pe_percentile_hi, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(stock_code) DO UPDATE SET
+                        trade_date = excluded.trade_date,
+                        pe_history = excluded.pe_history,
+                        pe_percentile_years = excluded.pe_percentile_years,
+                        pe_percentile_lo = excluded.pe_percentile_lo,
+                        pe_percentile_hi = excluded.pe_percentile_hi,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        stock_code,
+                        today,
+                        json.dumps(sorted(historical_pes), ensure_ascii=False),
+                        pe_info.get("pe_percentile_years") or len(historical_pes),
+                        pe_info.get("pe_percentile_lo") or min(historical_pes),
+                        pe_info.get("pe_percentile_hi") or max(historical_pes),
+                        now,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    @staticmethod
+    def _compact_pe_percentile(pe_info: dict) -> dict:
+        compact = {k: v for k, v in pe_info.items() if k != "pe_history"}
+        if "pe_history" in pe_info:
+            compact["pe_percentile_range"] = {
+                "low": pe_info.get("pe_percentile_lo"),
+                "high": pe_info.get("pe_percentile_hi"),
+                "years": pe_info.get("pe_percentile_years"),
+            }
+        return compact
 
     @staticmethod
     def _compute_pe_percentile(stock_code: str, current_pe: float,
@@ -384,16 +524,7 @@ class ToolExecutor:
                     "pe_percentile_note": f"仅{len(historical_pes)}年有效PE数据，需≥3年",
                 }
 
-            count_below = sum(1 for pe in historical_pes if pe < current_pe)
-            percentile = round(count_below / len(historical_pes) * 100, 1)
-
-            return {
-                "pe_percentile_pct":   percentile,
-                "pe_percentile_years": len(historical_pes),
-                "pe_percentile_lo":    round(min(historical_pes), 1),
-                "pe_percentile_hi":    round(max(historical_pes), 1),
-                "pe_history":          sorted(historical_pes),
-            }
+            return ToolExecutor._percentile_from_history(current_pe, historical_pes)
         except Exception as e:
             return {"pe_percentile_pct": None, "pe_percentile_note": f"计算失败: {e}"}
 
@@ -402,7 +533,8 @@ class ToolExecutor:
     def _tool_get_stock_data(self, stock_code: str) -> dict:
         # 腾讯行情（Docker 内可用，延迟低）
         try:
-            quote = fetch_tencent_quote(stock_code)
+            with console_timer("数据查询", f"腾讯行情 {stock_code}"):
+                quote = fetch_tencent_quote(stock_code)
         except Exception as e:
             return {"error": f"获取行情失败: {e}", "stock_code": stock_code}
 
@@ -415,9 +547,10 @@ class ToolExecutor:
         try:
             import akshare as ak
             import pandas as pd
-            div_df = ak.stock_history_dividend_detail(
-                symbol=stock_code, indicator="分红"
-            )
+            with console_timer("数据查询", f"AKShare 分红 {stock_code}"):
+                div_df = ak.stock_history_dividend_detail(
+                    symbol=stock_code, indicator="分红"
+                )
             if not div_df.empty and price > 0:
                 div_df["除权除息日"] = pd.to_datetime(
                     div_df["除权除息日"], errors="coerce"
@@ -439,9 +572,15 @@ class ToolExecutor:
             pe_num = None
 
         if pe_num and pe_num > 0:
-            pe_pct_info = self._compute_pe_percentile(stock_code, pe_num)
+            with console_timer("数据计算", f"PE历史百分位缓存 {stock_code}"):
+                pe_pct_info = self._load_cached_pe_percentile(stock_code, pe_num)
+            if pe_pct_info is None:
+                with console_timer("数据计算", f"PE历史百分位 {stock_code}"):
+                    pe_pct_info = self._compute_pe_percentile(stock_code, pe_num)
+                self._save_cached_pe_history(stock_code, pe_pct_info)
         else:
             pe_pct_info = {"pe_percentile_pct": None, "pe_percentile_note": "当前PE无效"}
+        pe_pct_info = self._compact_pe_percentile(pe_pct_info)
 
         return {
             "stock_code":    stock_code,
@@ -460,7 +599,8 @@ class ToolExecutor:
         import akshare as ak
         import pandas as pd
 
-        df = ak.stock_history_dividend_detail(symbol=stock_code, indicator="分红")
+        with console_timer("数据查询", f"AKShare 分红历史 {stock_code}"):
+            df = ak.stock_history_dividend_detail(symbol=stock_code, indicator="分红")
         if df.empty:
             return []
 
@@ -490,7 +630,8 @@ class ToolExecutor:
     def _tool_get_financials(self, stock_code: str) -> list:
         import akshare as ak
 
-        df = ak.stock_financial_abstract_ths(symbol=stock_code, indicator="按年度")
+        with console_timer("数据查询", f"AKShare 财务摘要 {stock_code}"):
+            df = ak.stock_financial_abstract_ths(symbol=stock_code, indicator="按年度")
         if df.empty:
             return []
 
@@ -508,7 +649,8 @@ class ToolExecutor:
     def _tool_get_ah_premium(self, stock_code: str) -> dict:
         import akshare as ak
 
-        df = ak.stock_zh_ah_spot_em()
+        with console_timer("数据查询", "AKShare AH溢价"):
+            df = ak.stock_zh_ah_spot_em()
         if df.empty:
             return {"error": "AH 数据获取失败"}
 
@@ -534,21 +676,26 @@ class ToolExecutor:
 
     def _tool_search_decisions(self, stock_code: str = None,
                                keyword: str = None, limit: int = 10) -> list:
-        return self.memory.decisions.search_decisions(
-            stock_code=stock_code, keyword=keyword, limit=limit
-        )
+        with console_timer("数据查询", "SQLite decisions"):
+            return self.memory.decisions.search_decisions(
+                stock_code=stock_code, keyword=keyword, limit=limit
+            )
 
     def _tool_get_positions(self) -> list:
-        return self.memory.decisions.get_positions()
+        with console_timer("数据查询", "SQLite positions"):
+            return self.memory.decisions.get_positions()
 
     def _tool_get_watchlist(self) -> list:
-        return self.memory.decisions.get_watchlist()
+        with console_timer("数据查询", "SQLite watchlist"):
+            return self.memory.decisions.get_watchlist()
 
     def _tool_search_retrospectives(self, decision_id: int) -> list:
-        return self.memory.decisions.search_retrospectives(decision_id)
+        with console_timer("数据查询", "SQLite retrospectives"):
+            return self.memory.decisions.search_retrospectives(decision_id)
 
     def _tool_retrieve_memory(self, query: str, top_k: int = 4) -> list:
-        return self.memory.episodic.retrieve(query, top_k=top_k)
+        with console_timer("数据查询", "记忆混合检索"):
+            return self.memory.episodic.retrieve(query, top_k=top_k)
 
     # ── WRITE handlers ────────────────────────
 

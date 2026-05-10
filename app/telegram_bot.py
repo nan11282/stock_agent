@@ -5,28 +5,54 @@ telegram_bot.py — Telegram 聊天助理
 LLM 自主调工具或闲聊，回复自动分段适配 Telegram 长度限制。
 """
 
+import asyncio
 import os
 
-from adapters import OpenAIAdapter
 from agent import Agent
+from runtime import build_default_llm
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+try:
+    from telegram.error import TelegramError
+except ImportError:
+    TelegramError = Exception
 
-# LLM 适配器——和 main.py 同一套
-_llm = OpenAIAdapter(
-    model="deepseek-v4-pro",
-    base_url="https://api.deepseek.com",
-    api_key=os.environ.get("DEEPSEEK_API_KEY_stock_agent"),
-)
+# LLM 适配器——和 main.py 同一套，按需构造
+_llm = None
 
 # per-user Agent 实例池
 _agents: dict[int, Agent] = {}
+_agent_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_llm():
+    global _llm
+    if _llm is None:
+        _llm = build_default_llm()
+    return _llm
 
 
 def _get_agent(chat_id: int) -> Agent:
     if chat_id not in _agents:
-        _agents[chat_id] = Agent(llm=_llm, max_steps=20)
+        _agents[chat_id] = Agent(llm=_get_llm(), max_steps=20)
     return _agents[chat_id]
+
+
+def _get_lock(chat_id: int) -> asyncio.Lock:
+    if chat_id not in _agent_locks:
+        _agent_locks[chat_id] = asyncio.Lock()
+    return _agent_locks[chat_id]
+
+
+async def _run_agent_chat(agent: Agent, text: str) -> str:
+    return await asyncio.to_thread(agent.chat, text)
+
+
+async def _delete_message_safely(message) -> None:
+    """Best-effort cleanup for transient Telegram API/network failures."""
+    try:
+        await message.delete()
+    except TelegramError as e:
+        print(f"[TelegramBot] 删除思考提示失败，已忽略: {e}")
 
 
 def _split_long_message(text: str, limit: int = 4000) -> list[str]:
@@ -34,12 +60,16 @@ def _split_long_message(text: str, limit: int = 4000) -> list[str]:
     parts = []
     current = ""
     for paragraph in text.split("\n"):
-        if len(current) + len(paragraph) + 1 > limit:
-            if current:
+        chunks = [paragraph[i:i + limit] for i in range(0, len(paragraph), limit)] or [""]
+        for chunk in chunks:
+            if not current:
+                current = chunk
+                continue
+            if len(current) + len(chunk) + 1 > limit:
                 parts.append(current.strip())
-            current = paragraph
-        else:
-            current += "\n" + paragraph if current else paragraph
+                current = chunk
+            else:
+                current += "\n" + chunk
     if current.strip():
         parts.append(current.strip())
     return parts or [text[:limit]]
@@ -65,12 +95,13 @@ async def _handle_message(update, context):
     thinking_msg = await update.message.reply_text("正在思考...")
 
     try:
-        response = agent.chat(text)
+        async with _get_lock(chat_id):
+            response = await _run_agent_chat(agent, text)
     except Exception as e:
         response = f"[分析出错] {e}"
 
     # 删除思考提示，分段发送回复
-    await thinking_msg.delete()
+    await _delete_message_safely(thinking_msg)
     for part in _split_long_message(response):
         await update.message.reply_text(part)
 
@@ -78,13 +109,14 @@ async def _handle_message(update, context):
 def start_bot():
     """启动 Telegram bot（阻塞当前线程，用事件驱动长轮询）。"""
 
-    if not TELEGRAM_TOKEN:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
         print("[TelegramBot] 未设置 TELEGRAM_BOT_TOKEN，跳过启动")
         return
 
     from telegram.ext import Application, MessageHandler, filters
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(token).build()
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, _handle_message
     ))

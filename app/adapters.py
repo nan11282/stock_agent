@@ -63,7 +63,7 @@ class LLMAdapter(ABC):
 # ─────────────────────────────────────────────
 
 class ClaudeAdapter(LLMAdapter):
-    def __init__(self, model: str = "claude-opus-4-5"):
+    def __init__(self, model: str = "claude-opus-4-7"):
         import anthropic
         self.client = anthropic.Anthropic()
         self.model = model
@@ -171,6 +171,8 @@ class OpenAIAdapter(LLMAdapter):
 
     def chat(self, messages: list[Message], tools: list[dict], system: str) -> LLMResponse:
         import json
+        from metrics import console_timer
+
         full_messages = [{"role": "system", "content": system}] + self._to_openai(messages)
 
         oai_tools = [
@@ -182,11 +184,12 @@ class OpenAIAdapter(LLMAdapter):
             for t in tools
         ] if tools else None
 
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=full_messages,
-            tools=oai_tools,
-        )
+        with console_timer("LLM API", f"model={self.model} messages={len(full_messages)} tools={len(tools or [])}"):
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=full_messages,
+                tools=oai_tools,
+            )
 
         msg = resp.choices[0].message
         tool_calls = []

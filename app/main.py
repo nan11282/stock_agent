@@ -2,9 +2,7 @@
 main.py — 入口
 """
 
-from adapters import ClaudeAdapter, OpenAIAdapter
 from agent import Agent
-import os
 import re
 
 try:
@@ -12,21 +10,13 @@ try:
 except ImportError:
     pass
 
+from runtime import build_default_llm
+
 _CTRL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
 def main():
-    # ── 切换 LLM 只改这一行 ───────────────────
-    # llm = ClaudeAdapter(model="claude-opus-4-5")
-    # llm = OpenAIAdapter(model="gpt-4o")
-    llm = OpenAIAdapter(
-        model="deepseek-v4-pro",
-        base_url="https://api.deepseek.com",
-        api_key=os.environ.get("DEEPSEEK_API_KEY_stock_agent"),
-    )
-    # ──────────────────────────────────────────
-
-    agent = Agent(llm=llm, max_steps=20)
+    agent = Agent(llm=build_default_llm(), max_steps=20)
 
     print("=== A股投资助理 ===")
     print("reset → 清空对话   quit → 退出\n")
