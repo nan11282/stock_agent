@@ -7,11 +7,12 @@ WRITE tools (7) : 必须用户明确指令 + 展示内容 + 等待"确认"后才
 
 import json
 import os
+import re
 import sqlite3
 import threading
 from datetime import date, datetime
 
-from memory import DB_PATH, MemoryManager
+from memory import DB_PATH, MemoryManager, _enable_wal_safely
 from metrics import console_timer, get_tracer
 
 
@@ -20,6 +21,24 @@ from metrics import console_timer, get_tracer
 # ─────────────────────────────────────────────
 
 READ_TOOLS = [
+    {
+        "name": "calculate_dividend_reinvestment",
+        "description": (
+            "计算A股按月定投与股息复投的长期估算：每月买入多少手、"
+            "持有多少年、股息是否复投，返回累计股息、第N年当年股息、"
+            "复投新增股数和剩余现金。适合定投/股息复投/长期收益问题。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stock_code": {"type": "string", "description": "6位股票代码，如 601398"},
+                "monthly_lots": {"type": "integer", "description": "每月定投手数，1手=100股"},
+                "years": {"type": "integer", "description": "测算年限"},
+                "dividend_reinvest": {"type": "boolean", "description": "是否用股息复投"},
+            },
+            "required": ["stock_code", "monthly_lots", "years"],
+        },
+    },
     {
         "name": "get_stock_data",
         "description": "获取A股实时行情与估值：当前价格、PE、PB、TTM股息率、PE历史百分位（当前PE在近10年中的分位，越低越便宜）。Agent可自主调用。",
@@ -263,6 +282,12 @@ ALL_TOOLS = READ_TOOLS + WRITE_TOOLS
 WRITE_TOOL_NAMES = {tool["name"] for tool in WRITE_TOOLS}
 
 
+STOCK_NAME_ALIASES = {
+    "工商银行": "601398",
+    "工行": "601398",
+}
+
+
 # ─────────────────────────────────────────────
 # Tool Executor
 # ─────────────────────────────────────────────
@@ -279,6 +304,8 @@ def exchange_prefix(stock_code: str) -> str:
 def fetch_tencent_quote(stock_code: str) -> dict:
     """从腾讯行情 API 获取单只股票实时数据。"""
     import requests
+    # 腾讯行情字段覆盖价格、PE/PB、市值和52周区间，适合做低延迟第一手快照；
+    # 更重的财务、分红数据再由 AKShare 补齐。
     prefix = exchange_prefix(stock_code)
     url = f"http://qt.gtimg.cn/q={prefix}{stock_code}"
     r = requests.get(url, timeout=10)
@@ -295,6 +322,101 @@ def fetch_tencent_quote(stock_code: str) -> dict:
     }
 
 
+def resolve_stock_code(text: str) -> str | None:
+    # 先识别显式6位代码，再走少量高频别名。
+    # 业务上宁可少猜，也不要把模糊股票名误映射到错误标的。
+    match = re.search(r"(?<!\d)\d{6}(?!\d)", text or "")
+    if match:
+        return match.group(0)
+    for name, code in STOCK_NAME_ALIASES.items():
+        if name in (text or ""):
+            return code
+    return None
+
+
+def calculate_dividend_reinvestment_projection(
+    *,
+    stock_code: str,
+    stock_name: str,
+    price: float,
+    annual_dividend_per_share: float,
+    monthly_lots: int,
+    years: int,
+    dividend_reinvest: bool = True,
+    dividend_source_date: str | None = None,
+) -> dict:
+    # 这是一个静态口径的长期现金流模型：
+    # 假设价格和每股分红不变，定投按月买入，分红按年结算，并按A股整手复投。
+    if price <= 0:
+        return {"error": "当前价格无效，无法计算复投股数", "stock_code": stock_code}
+    if annual_dividend_per_share <= 0:
+        return {"error": "每股分红无效，无法计算股息收益", "stock_code": stock_code}
+    if monthly_lots <= 0:
+        return {"error": "每月定投手数必须大于0", "stock_code": stock_code}
+    if years <= 0:
+        return {"error": "测算年限必须大于0", "stock_code": stock_code}
+
+    monthly_shares = monthly_lots * 100
+    annual_buy_shares = monthly_shares * 12
+    shares = 0
+    reinvested_shares = 0
+    carry_cash = 0.0
+    cumulative_dividend = 0.0
+    yearly = []
+
+    for year in range(1, years + 1):
+        starting_shares = shares
+        # 每年先累计12个月定投股数，再按年末持股计算当年现金分红。
+        shares += annual_buy_shares
+        cash_dividend = round(shares * annual_dividend_per_share, 2)
+        cumulative_dividend = round(cumulative_dividend + cash_dividend, 2)
+
+        reinvest_shares = 0
+        available_cash = carry_cash + cash_dividend
+        if dividend_reinvest:
+            # A股买入以100股为一手，股息不够一手时留作下年现金结转。
+            lot_cost = price * 100
+            reinvest_lots = int(available_cash // lot_cost)
+            reinvest_shares = reinvest_lots * 100
+            if reinvest_shares:
+                shares += reinvest_shares
+                reinvested_shares += reinvest_shares
+            carry_cash = round(available_cash - reinvest_shares * price, 2)
+        else:
+            carry_cash = round(available_cash, 2)
+
+        yearly.append({
+            "year": year,
+            "starting_shares": starting_shares,
+            "regular_buy_shares": annual_buy_shares,
+            "cash_dividend": cash_dividend,
+            "reinvested_shares": reinvest_shares,
+            "ending_shares": shares,
+            "carry_cash": carry_cash,
+        })
+
+    last_year = yearly[-1]
+    return {
+        "stock_code": stock_code,
+        "stock_name": stock_name,
+        "price": round(price, 3),
+        "annual_dividend_per_share": round(annual_dividend_per_share, 4),
+        "dividend_source_date": dividend_source_date,
+        "monthly_lots": monthly_lots,
+        "monthly_shares": monthly_shares,
+        "years": years,
+        "dividend_reinvest": dividend_reinvest,
+        "regular_buy_shares": annual_buy_shares * years,
+        "reinvested_shares": reinvested_shares,
+        "ending_shares": shares,
+        "cumulative_dividend": cumulative_dividend,
+        "last_year_dividend": last_year["cash_dividend"],
+        "remaining_cash": carry_cash,
+        "assumption": "当前股价和最近年度每股现金分红长期不变；按年末分红并按A股整手复投，剩余现金结转。",
+        "yearly": yearly,
+    }
+
+
 class ToolExecutor:
     _pe_cache_lock = threading.Lock()
 
@@ -308,6 +430,8 @@ class ToolExecutor:
             with console_timer("工具执行", f"{tool_name} input={tool_input}"):
                 try:
                     if tool_name in WRITE_TOOL_NAMES and not allow_write:
+                        # 工具层再次兜底：即使 LLM 或调用方绕过 Agent 流程，
+                        # 写入数据库也必须显式带 allow_write=True。
                         out = json.dumps({
                             "error": "写工具需要用户确认后才能执行",
                             "tool": tool_name,
@@ -346,7 +470,9 @@ class ToolExecutor:
         with cls._pe_cache_lock:
             conn = sqlite3.connect(db_path, timeout=30)
             try:
-                conn.execute("PRAGMA journal_mode=WAL")
+                _enable_wal_safely(conn, "pe_percentile_cache")
+                # PE历史百分位的原始历史PE按交易日缓存。
+                # 当天多次问同一只股票时，只用当前PE重新算分位，避免反复拉10年数据。
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS pe_percentile_cache (
                         stock_code           TEXT PRIMARY KEY,
@@ -364,6 +490,8 @@ class ToolExecutor:
 
     @staticmethod
     def _percentile_from_history(current_pe: float, historical_pes: list[float]) -> dict:
+        # 百分位含义：历史PE中有多少比例低于当前PE。
+        # 数值越低，说明当前估值越接近历史低位。
         count_below = sum(1 for pe in historical_pes if pe < current_pe)
         percentile = round(count_below / len(historical_pes) * 100, 1)
         return {
@@ -507,6 +635,7 @@ class ToolExecutor:
                         continue
                     eps = float(eps_str)
                     if eps <= 0:
+                        # EPS为负时PE失真，不能纳入“估值便宜/贵”的历史分位样本。
                         continue
 
                     nearby = price_df[price_df["date"] <= report_date]
@@ -529,6 +658,60 @@ class ToolExecutor:
             return {"pe_percentile_pct": None, "pe_percentile_note": f"计算失败: {e}"}
 
     # ── READ handlers ─────────────────────────
+
+    def _tool_calculate_dividend_reinvestment(
+        self,
+        stock_code: str,
+        monthly_lots: int,
+        years: int,
+        dividend_reinvest: bool = True,
+    ) -> dict:
+        import akshare as ak
+        import pandas as pd
+
+        try:
+            with console_timer("数据查询", f"腾讯行情 {stock_code}"):
+                quote = fetch_tencent_quote(stock_code)
+        except Exception as e:
+            return {"error": f"获取行情失败: {e}", "stock_code": stock_code}
+
+        price = quote.get("price") or 0.0
+        if price <= 0:
+            return {"error": "当前价格无效，无法计算复投股数", "stock_code": stock_code}
+
+        with console_timer("数据查询", f"AKShare 最近分红 {stock_code}"):
+            div_df = ak.stock_history_dividend_detail(symbol=stock_code, indicator="分红")
+        if div_df.empty:
+            return {"error": "分红数据不可用，无法计算股息复投", "stock_code": stock_code}
+
+        div_df["除权除息日"] = pd.to_datetime(div_df["除权除息日"], errors="coerce")
+        div_df = div_df.dropna(subset=["除权除息日"]).sort_values("除权除息日", ascending=False)
+        div_df = div_df[div_df["除权除息日"] <= pd.Timestamp.now()]
+        latest = None
+        for _, row in div_df.iterrows():
+            try:
+                div_per_share = float(row["派息"]) / 10
+            except (ValueError, TypeError, KeyError):
+                continue
+            if div_per_share > 0:
+                # 取最近一次有效现金分红作为静态年化口径，避免送转股记录污染现金分红测算。
+                latest = (row, div_per_share)
+                break
+
+        if latest is None:
+            return {"error": "未找到有效现金分红数据，无法计算股息复投", "stock_code": stock_code}
+
+        row, annual_dividend_per_share = latest
+        return calculate_dividend_reinvestment_projection(
+            stock_code=stock_code,
+            stock_name=quote.get("name") or stock_code,
+            price=float(price),
+            annual_dividend_per_share=annual_dividend_per_share,
+            monthly_lots=int(monthly_lots),
+            years=int(years),
+            dividend_reinvest=bool(dividend_reinvest),
+            dividend_source_date=str(row["除权除息日"].date()),
+        )
 
     def _tool_get_stock_data(self, stock_code: str) -> dict:
         # 腾讯行情（Docker 内可用，延迟低）
@@ -556,6 +739,7 @@ class ToolExecutor:
                     div_df["除权除息日"], errors="coerce"
                 )
                 cutoff = pd.Timestamp.now() - pd.DateOffset(months=12)
+                # TTM股息率只看最近12个月已除权的现金派息，更贴近“当前买入能对应的股息水平”。
                 recent = div_df[div_df["除权除息日"] >= cutoff]
                 if not recent.empty:
                     total_div_per_10 = recent["派息"].astype(float).sum()
@@ -575,6 +759,7 @@ class ToolExecutor:
             with console_timer("数据计算", f"PE历史百分位缓存 {stock_code}"):
                 pe_pct_info = self._load_cached_pe_percentile(stock_code, pe_num)
             if pe_pct_info is None:
+                # 缓存未命中才拉年度EPS和10年K线；这是全项目最重的行情计算之一。
                 with console_timer("数据计算", f"PE历史百分位 {stock_code}"):
                     pe_pct_info = self._compute_pe_percentile(stock_code, pe_num)
                 self._save_cached_pe_history(stock_code, pe_pct_info)
@@ -608,6 +793,7 @@ class ToolExecutor:
         df = df.dropna(subset=["除权除息日"])
 
         cutoff = pd.Timestamp.now() - pd.DateOffset(years=years)
+        # 分红历史保留逐次记录，而不是提前汇总，方便 Agent 判断稳定性和间断年份。
         df = df[df["除权除息日"] >= cutoff].copy()
         df = df.sort_values("除权除息日", ascending=False)
 
@@ -637,6 +823,8 @@ class ToolExecutor:
 
         df = df.head(5)
 
+        # 财务摘要只取投资判断最常用的质量指标：收入、利润、EPS、ROE、净资产和负债率。
+        # 更细的财报科目不进工具结果，避免挤占 LLM 上下文。
         keep_cols = [
             "报告期", "营业总收入", "净利润", "基本每股收益",
             "净资产收益率", "每股净资产", "资产负债率",
@@ -660,6 +848,7 @@ class ToolExecutor:
 
         row = df[df[code_col] == stock_code]
         if row.empty:
+            # 不是所有A股都有H股映射；返回 note 让 Agent 明确说明“该维度不适用”。
             return {
                 "stock_code": stock_code,
                 "note": "该股票不在AH比价列表中，可能未在港股上市",

@@ -37,6 +37,8 @@ class DailyScanner:
     def scan_positions(self) -> list[dict]:
         import akshare as ak
 
+        # 持仓扫描回答的是“我已经买了的东西今天是否偏离预期”。
+        # 因此核心信号是成本价相对现价的盈亏幅度，再补充 PE 做估值观察。
         positions = self.memory.decisions.get_positions()
         results = []
 
@@ -55,9 +57,11 @@ class DailyScanner:
                 if pnl_pct is not None:
                     summary_parts.append(f"盈亏{pnl_pct}%")
                     if pnl_pct < -10:
+                        # 跌破成本较多时先提醒复核基本面/仓位，而不是自动给卖出建议。
                         signal = "alert"
                         summary_parts.append("跌幅超10%需关注")
                     elif pnl_pct > 30:
+                        # 大幅浮盈触发止盈检查，适合高股息/低估值策略里的再平衡提醒。
                         signal = "alert"
                         summary_parts.append("涨幅超30%可考虑止盈")
 
@@ -120,6 +124,7 @@ class DailyScanner:
                 if ttm_yield is not None:
                     summary_parts.append(f"TTM股息率{ttm_yield}%")
                     if w.get("alert_yield") and ttm_yield >= w["alert_yield"]:
+                        # 自选股的提醒不是“买入指令”，只是说明用户预设的观察条件已经触发。
                         signal = "alert"
                         summary_parts.append(f"达到股息率阈值{w['alert_yield']}%")
 
@@ -149,6 +154,7 @@ class DailyScanner:
         results = []
 
         # 已知持仓和自选的代码，用于排除
+        # 市场发现优先补充新机会，避免日报反复推荐用户已经跟踪的标的。
         known_codes = set()
         for p in self.memory.decisions.get_positions():
             known_codes.add(p["stock_code"])
@@ -156,6 +162,8 @@ class DailyScanner:
             known_codes.add(w["stock_code"])
 
         # ── 维度1：AH折价（溢价率<80的，即A股比H股便宜）──
+        # AH折价是这里的量化发现入口：同一公司两地价格差过大时，
+        # 说明A股可能出现相对低估，需要进一步看流动性、汇率和业务基本面。
         try:
             ah_df = ak.stock_zh_ah_spot_em()
             if not ah_df.empty:
@@ -224,6 +232,7 @@ class DailyScanner:
         executor = ToolExecutor(self.memory)
 
         # 将扫描结果整理成上下文
+        # 规则扫描只负责“发现异常/机会线索”，最终日报观点交给 LLM 再调用读工具补证据。
         all_data = json.dumps({
             "持仓扫描": pos_results,
             "自选监控": watch_results,
@@ -245,6 +254,7 @@ class DailyScanner:
                 break
 
             def run_tool(tc):
+                # 日报里的深度分析同样只开放读工具，避免定时任务在无人确认时写入决策库。
                 print(f"  [分析工具] {tc.name} {tc.input}")
                 with console_timer("scheduler", f"tool {tc.name}"):
                     return executor.execute(tc.name, tc.input)
@@ -276,6 +286,8 @@ class DailyScanner:
     def run(self):
         print(f"[{datetime.now().isoformat()}] 开始每日扫描...")
 
+        # 三层扫描分别覆盖：已有持仓风险、自选触发条件、组合外机会。
+        # 先做结构化扫描，再用 LLM 生成可读投资报告。
         with console_timer("每日扫描", "持仓扫描"):
             pos_results = self.scan_positions()
         with console_timer("每日扫描", "自选监控"):
@@ -302,6 +314,7 @@ class DailyScanner:
             print(f"  邮件发送失败: {e}")
 
         # 结果写入 scan_results 表
+        # 保存扫描原始信号，便于后续追踪“某个提醒持续出现了几天”。
         with console_timer("每日扫描", "scan_results写入"):
             for item in pos_results + watch_results + disc_results:
                 self.memory.decisions.save_scan_result(item)
@@ -310,6 +323,7 @@ class DailyScanner:
 
 
 def _already_scanned_today(scanner: "DailyScanner") -> bool:
+    # 容器重启后用于防止同一天重复补发日报。
     today = datetime.now().strftime("%Y-%m-%d")
     row = scanner.memory.decisions.conn.execute(
         "SELECT 1 FROM scan_results WHERE scanned_at >= ? LIMIT 1", (today,)
@@ -325,10 +339,12 @@ def main():
     scanner = DailyScanner()
 
     if args.now:
+        # 手动触发用于调试或盘后临时补发，不受当天是否已扫描限制。
         scanner.run()
         return
 
     # 启动时补发：若已过 15:30 且今天尚未扫描，立即执行一次
+    # 这解决容器在收盘后才启动时错过 schedule 定时点的问题。
     now = datetime.now()
     trigger = now.replace(hour=15, minute=30, second=0, microsecond=0)
     if now >= trigger and not _already_scanned_today(scanner):

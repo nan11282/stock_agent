@@ -26,10 +26,12 @@ MAIL_TO = os.environ.get("MAIL_TO", "")
 def _build_html(summary: str, positions: list[dict],
                 watchlist: list[dict], discovery: list[dict]) -> str:
     today = date.today().isoformat()
+    # 邮件报告服务于盘后快速复核：先给 LLM 综合结论，再把持仓、自选、发现分表列出。
     summary = summary.replace("\n", "<br>")  # 长文分析换行转 HTML
 
     # 信号标签
     def signal_tag(signal: str, scope: str = "") -> str:
+        # 邮件里的颜色只表达“需要注意程度”，不等同买卖建议。
         if signal == "alert":
             return '<span style="color:#d32f2f;font-weight:bold">⚠ 需关注</span>'
         if signal == "opportunity":
@@ -136,10 +138,12 @@ def _build_html(summary: str, positions: list[dict],
 def send_report(summary: str, positions: list[dict],
                 watchlist: list[dict], discovery: list[dict]) -> None:
     if not MAIL_USER or not MAIL_PASS or not MAIL_TO:
+        # 允许本地/测试环境不配置 SMTP；日报生成失败不应阻塞扫描结果落库。
         print("  [邮件] 未配置 MAIL_USER / MAIL_PASS / MAIL_TO，跳过发送")
         return
 
     today = date.today().isoformat()
+    # 邮件标题把提醒数量前置，用户不用打开邮件也能知道今天是否有需要处理的事项。
     alert_count = sum(1 for r in positions + watchlist if r.get("signal") == "alert")
     opp_count = sum(1 for r in discovery if r.get("signal") == "opportunity")
 

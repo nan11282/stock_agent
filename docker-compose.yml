@@ -7,13 +7,18 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       - DEEPSEEK_API_KEY_stock_agent=${DEEPSEEK_API_KEY_stock_agent}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-v4-pro}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - LLM_TIMEOUT_SECONDS=${LLM_TIMEOUT_SECONDS:-60}
+      - LLM_MAX_RETRIES=${LLM_MAX_RETRIES:-0}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - DB_PATH=/app/data/investment.db
+      - DB_PATH=${DB_PATH:-/app/data/investment_live.db}
       - CHROMA_PATH=/app/chroma_db
       - HF_HOME=/root/.cache/huggingface
-      - RERANK_ENABLED=${RERANK_ENABLED:-1}
+      - RERANK_ENABLED=${RERANK_ENABLED:-false}
       - RERANK_MODEL=${RERANK_MODEL:-BAAI/bge-reranker-base}
       - RERANK_POOL_SIZE=${RERANK_POOL_SIZE:-12}
+      - AGENT_READ_TOOL_ROUNDS=${AGENT_READ_TOOL_ROUNDS:-2}
       - HTTP_PROXY=http://host.docker.internal:7890
       - HTTPS_PROXY=http://host.docker.internal:7890
       - NO_PROXY=localhost,127.0.0.1
@@ -30,13 +35,18 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       - DEEPSEEK_API_KEY_stock_agent=${DEEPSEEK_API_KEY_stock_agent}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-v4-pro}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - LLM_TIMEOUT_SECONDS=${LLM_TIMEOUT_SECONDS:-60}
+      - LLM_MAX_RETRIES=${LLM_MAX_RETRIES:-0}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - DB_PATH=/app/data/investment.db
+      - DB_PATH=${DB_PATH:-/app/data/investment_live.db}
       - CHROMA_PATH=/app/chroma_db
       - HF_HOME=/root/.cache/huggingface
-      - RERANK_ENABLED=${RERANK_ENABLED:-1}
+      - RERANK_ENABLED=${RERANK_ENABLED:-false}
       - RERANK_MODEL=${RERANK_MODEL:-BAAI/bge-reranker-base}
       - RERANK_POOL_SIZE=${RERANK_POOL_SIZE:-12}
+      - AGENT_READ_TOOL_ROUNDS=${AGENT_READ_TOOL_ROUNDS:-2}
       - MAIL_HOST=${MAIL_HOST:-smtp.qq.com}
       - MAIL_PORT=${MAIL_PORT:-465}
       - MAIL_USER=${MAIL_USER}
@@ -45,6 +55,13 @@ services:
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_TIMEOUT_SECONDS=${TELEGRAM_CHAT_TIMEOUT_SECONDS:-300}
+      - TELEGRAM_AGENT_MAX_STEPS=${TELEGRAM_AGENT_MAX_STEPS:-8}
+      - TELEGRAM_CONNECTION_POOL_SIZE=${TELEGRAM_CONNECTION_POOL_SIZE:-32}
+      - TELEGRAM_GET_UPDATES_POOL_SIZE=${TELEGRAM_GET_UPDATES_POOL_SIZE:-8}
+      - TELEGRAM_POOL_TIMEOUT_SECONDS=${TELEGRAM_POOL_TIMEOUT_SECONDS:-30}
+      - TELEGRAM_CONNECT_TIMEOUT_SECONDS=${TELEGRAM_CONNECT_TIMEOUT_SECONDS:-30}
+      - TELEGRAM_READ_TIMEOUT_SECONDS=${TELEGRAM_READ_TIMEOUT_SECONDS:-60}
       - HTTP_PROXY=http://host.docker.internal:7890
       - HTTPS_PROXY=http://host.docker.internal:7890
       - NO_PROXY=localhost,127.0.0.1

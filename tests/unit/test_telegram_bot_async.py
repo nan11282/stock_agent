@@ -3,7 +3,19 @@ import threading
 from types import SimpleNamespace
 
 import telegram_bot
-from telegram_bot import _delete_message_safely, _handle_message, _run_agent_chat
+from telegram_bot import (
+    _delete_message_safely,
+    _handle_error,
+    _handle_message,
+    _run_agent_chat,
+    _telegram_connect_timeout_seconds,
+    _telegram_connection_pool_size,
+    _telegram_pool_timeout_seconds,
+)
+
+
+async def _noop_delete():
+    return None
 
 
 class FakeAgent:
@@ -39,6 +51,42 @@ def test_delete_message_safely_ignores_telegram_timeout(monkeypatch):
     asyncio.run(_delete_message_safely(TimeoutMessage()))
 
 
+def test_telegram_connection_settings_from_env(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_CONNECTION_POOL_SIZE", "64")
+    monkeypatch.setenv("TELEGRAM_POOL_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("TELEGRAM_CONNECT_TIMEOUT_SECONDS", "20")
+
+    assert _telegram_connection_pool_size() == 64
+    assert _telegram_pool_timeout_seconds() == 45
+    assert _telegram_connect_timeout_seconds() == 20
+
+
+def test_telegram_connection_settings_fallback_to_safe_minimum(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_CONNECTION_POOL_SIZE", "0")
+    monkeypatch.setenv("TELEGRAM_POOL_TIMEOUT_SECONDS", "bad")
+    monkeypatch.setenv("TELEGRAM_CONNECT_TIMEOUT_SECONDS", "-3")
+
+    assert _telegram_connection_pool_size() == 1
+    assert _telegram_pool_timeout_seconds() == 30
+    assert _telegram_connect_timeout_seconds() == 1
+
+
+def test_handle_error_logs_context(capsys):
+    update = SimpleNamespace(
+        update_id=789,
+        effective_chat=SimpleNamespace(id=123),
+    )
+    context = SimpleNamespace(error=RuntimeError("polling failed"))
+
+    asyncio.run(_handle_error(update, context))
+
+    out = capsys.readouterr().out
+    assert "update_id=789" in out
+    assert "chat_id=123" in out
+    assert "RuntimeError" in out
+    assert "polling failed" in out
+
+
 def test_handle_message_sends_response_when_thinking_delete_times_out(monkeypatch):
     class TimeoutThinkingMessage:
         async def delete(self):
@@ -54,7 +102,7 @@ def test_handle_message_sends_response_when_thinking_delete_times_out(monkeypatc
             self.replies.append(text)
             if text == "正在思考...":
                 return TimeoutThinkingMessage()
-            return SimpleNamespace(delete=lambda: None)
+            return SimpleNamespace(delete=_noop_delete)
 
     class ChatAgent:
         def chat(self, text):
@@ -72,3 +120,70 @@ def test_handle_message_sends_response_when_thinking_delete_times_out(monkeypatc
     asyncio.run(_handle_message(update, SimpleNamespace()))
 
     assert message.replies == ["正在思考...", "echo: hello"]
+
+
+def test_handle_message_sends_thinking_before_agent_init(monkeypatch):
+    events = []
+
+    class FakeMessage:
+        text = "hello"
+
+        async def reply_text(self, text):
+            events.append(f"reply:{text}")
+            return SimpleNamespace(delete=_noop_delete)
+
+    class ChatAgent:
+        def chat(self, text):
+            events.append("chat")
+            return "done"
+
+    def get_agent(chat_id):
+        events.append("get_agent")
+        return ChatAgent()
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=123),
+        message=message,
+    )
+
+    monkeypatch.setattr(telegram_bot, "_get_agent", get_agent)
+
+    asyncio.run(_handle_message(update, SimpleNamespace()))
+
+    assert events[:2] == ["reply:正在思考...", "get_agent"]
+    assert events[-1] == "reply:done"
+
+
+def test_handle_message_replies_when_agent_times_out(monkeypatch):
+    class FakeMessage:
+        text = "slow question"
+
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text):
+            self.replies.append(text)
+            return SimpleNamespace(delete=_noop_delete)
+
+    class ChatAgent:
+        pass
+
+    async def slow_chat(agent, text):
+        await asyncio.sleep(1)
+        return "too late"
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=456),
+        message=message,
+    )
+
+    monkeypatch.setenv("TELEGRAM_CHAT_TIMEOUT_SECONDS", "1")
+    monkeypatch.setattr(telegram_bot, "_get_agent", lambda chat_id: ChatAgent())
+    monkeypatch.setattr(telegram_bot, "_run_agent_chat", slow_chat)
+
+    asyncio.run(_handle_message(update, SimpleNamespace()))
+
+    assert message.replies[0] == "正在思考..."
+    assert message.replies[1].startswith("[分析超时]")

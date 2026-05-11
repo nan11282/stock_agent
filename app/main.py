@@ -16,6 +16,8 @@ _CTRL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
 def main():
+    # CLI 是最直接的本地调试入口：同样走完整 Agent/ReAct/记忆/工具链路，
+    # 因此这里的行为应与 Telegram 聊天保持一致。
     agent = Agent(llm=build_default_llm(), max_steps=20)
 
     print("=== A股投资助理 ===")
@@ -35,6 +37,7 @@ def main():
         if user_input.lower() == "quit":
             break
         if user_input.lower() == "reset":
+            # reset 只清空当前 CLI 会话上下文，长期记忆和数据库继续保留。
             agent.reset()
             continue
 

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ToolCall:
+    # LLM 说“要调用哪个业务工具、带什么参数”，Agent 再决定是否允许执行。
     id: str
     name: str
     input: dict
@@ -53,6 +54,7 @@ class LLMResponse:
 # ─────────────────────────────────────────────
 
 class LLMAdapter(ABC):
+    # Agent 只依赖这个抽象接口，因此业务循环不关心底层是 Claude、OpenAI 还是 DeepSeek。
     @abstractmethod
     def chat(self, messages: list[Message], tools: list[dict], system: str) -> LLMResponse:
         ...
@@ -70,6 +72,8 @@ class ClaudeAdapter(LLMAdapter):
 
     @staticmethod
     def _to_anthropic(messages: list[Message]) -> list[dict]:
+        # Anthropic 把 tool_result 放在 user content block 里，
+        # 适配层负责格式差异，避免污染 Agent 的业务逻辑。
         out: list[dict] = []
         for m in messages:
             if m.role == "user":
@@ -129,14 +133,36 @@ class ClaudeAdapter(LLMAdapter):
 # ─────────────────────────────────────────────
 
 class OpenAIAdapter(LLMAdapter):
-    def __init__(self, model: str = "gpt-4o", base_url: str = None, api_key: str = None):
+    def __init__(
+        self,
+        model: str = "gpt-4o",
+        base_url: str = None,
+        api_key: str = None,
+        timeout: float | None = None,
+        max_retries: int = 0,
+    ):
+        import httpx
         from openai import OpenAI
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        request_timeout = httpx.Timeout(
+            connect=10.0,
+            read=timeout or 60.0,
+            write=10.0,
+            pool=10.0,
+        )
+        self.timeout = request_timeout
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=request_timeout,
+            max_retries=max_retries,
+        )
         self.model = model
 
     @staticmethod
     def _to_openai(messages: list[Message]) -> list[dict]:
         import json
+        # OpenAI 兼容接口要求工具结果用 role=tool 单独回传；
+        # 这里把内部统一 Message 历史翻译成 API 所需格式。
         out: list[dict] = []
         for m in messages:
             if m.role == "user":
@@ -176,6 +202,7 @@ class OpenAIAdapter(LLMAdapter):
         full_messages = [{"role": "system", "content": system}] + self._to_openai(messages)
 
         oai_tools = [
+            # 项目自己的 tool schema 转成 OpenAI function calling schema。
             {"type": "function", "function": {
                 "name": t["name"],
                 "description": t["description"],
@@ -189,6 +216,7 @@ class OpenAIAdapter(LLMAdapter):
                 model=self.model,
                 messages=full_messages,
                 tools=oai_tools,
+                timeout=self.timeout,
             )
 
         msg = resp.choices[0].message
@@ -202,6 +230,7 @@ class OpenAIAdapter(LLMAdapter):
                 ))
 
         # DeepSeek V4 推理链
+        # reasoning_content 保存进历史，保证多步工具调用时模型能延续自己的推理状态。
         reasoning = getattr(msg, "reasoning_content", None)
 
         return LLMResponse(

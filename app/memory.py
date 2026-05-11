@@ -30,6 +30,14 @@ RERANK_MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-base")
 RERANK_POOL_SIZE = int(os.environ.get("RERANK_POOL_SIZE", "12"))
 
 
+def _enable_wal_safely(conn, label: str) -> None:
+    try:
+        # WAL 允许读写并发，适合 Telegram 聊天和定时扫描同时访问同一个 SQLite 文件。
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as e:
+        print(f"  [SQLite] WAL启用失败，降级继续 label={label}: {e}", flush=True)
+
+
 # ─────────────────────────────────────────────
 # SQLite -- 决策日志 / 自选股 / 持仓 / 复盘
 # ─────────────────────────────────────────────
@@ -43,9 +51,10 @@ class DecisionLog:
         self._init_schema()
 
     def _init_schema(self):
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        _enable_wal_safely(self.conn, "DecisionLog")
         self.conn.executescript("""
             -- 投资决策记录（append-only，不允许 UPDATE）
+            -- 业务含义：历史判断必须可追溯，后续修正通过 retrospectives 追加，不覆盖原判断。
             CREATE TABLE IF NOT EXISTS decisions (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at  TEXT NOT NULL,
@@ -62,6 +71,7 @@ class DecisionLog:
             );
 
             -- 自选股关注列表
+            -- 业务含义：这是“等待价格/估值触发”的观察池，通常不代表已买入。
             CREATE TABLE IF NOT EXISTS watchlist (
                 stock_code   TEXT PRIMARY KEY,
                 stock_name   TEXT NOT NULL,
@@ -72,6 +82,7 @@ class DecisionLog:
             );
 
             -- 持仓表
+            -- 业务含义：这是当前组合事实，用于每轮回答时约束仓位、风险和重复推荐。
             CREATE TABLE IF NOT EXISTS positions (
                 stock_code   TEXT PRIMARY KEY,
                 stock_name   TEXT NOT NULL,
@@ -83,6 +94,7 @@ class DecisionLog:
             );
 
             -- 复盘表（挂在 decisions 下，不修改原始记录）
+            -- 业务含义：把“当时为什么这么想”和“后来验证如何”分开保存，方便反思偏差。
             CREATE TABLE IF NOT EXISTS retrospectives (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 decision_id     INTEGER NOT NULL REFERENCES decisions(id),
@@ -94,6 +106,7 @@ class DecisionLog:
             );
 
             -- 对话摘要存储（供向量检索使用的原始文本）
+            -- 业务含义：只沉淀可复用的投资洞察摘要，而不是保存完整聊天噪声。
             CREATE TABLE IF NOT EXISTS episodic_docs (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 doc_id      TEXT UNIQUE NOT NULL,
@@ -103,6 +116,7 @@ class DecisionLog:
             );
 
             -- 每日扫描结果
+            -- 业务含义：保存每日自动体检快照，后续可以追踪提醒是否连续出现。
             CREATE TABLE IF NOT EXISTS scan_results (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 scanned_at  TEXT NOT NULL,
@@ -124,6 +138,7 @@ class DecisionLog:
 
     def search_decisions(self, stock_code: str = None,
                          keyword: str = None, limit: int = 10) -> list[dict]:
+        # 决策日志检索服务于复盘：既可以按股票代码查，也可以按理由/标签里的主题查。
         query = "SELECT * FROM decisions WHERE 1=1"
         params: list = []
         if stock_code:
@@ -144,6 +159,7 @@ class DecisionLog:
         return dict(row) if row else None
 
     def get_positions(self) -> list[dict]:
+        # 按仓位从高到低返回，让 prompt 里最重要的风险暴露排在前面。
         rows = self.conn.execute(
             "SELECT * FROM positions ORDER BY position_pct DESC"
         ).fetchall()
@@ -165,6 +181,7 @@ class DecisionLog:
     # ── 写操作（必须经用户确认后才能调用）────────
 
     def save_decision(self, data: dict) -> int:
+        # 决策记录只新增不更新，避免事后改写历史判断。
         cur = self.conn.execute("""
             INSERT INTO decisions
             (created_at, stock_code, stock_name, action, view,
@@ -194,6 +211,7 @@ class DecisionLog:
         return affected > 0
 
     def save_retrospective(self, data: dict) -> int:
+        # 复盘是对原决策的补充证据，保留 outcome 和 missed points 供以后纠偏。
         cur = self.conn.execute("""
             INSERT INTO retrospectives
             (decision_id, reviewed_at, price_now, outcome, what_i_missed, updated_view)
@@ -210,6 +228,7 @@ class DecisionLog:
         return cur.lastrowid
 
     def upsert_position(self, data: dict) -> None:
+        # 持仓是当前状态表，允许 upsert，因为成本、股数、仓位会随交易变化。
         self.conn.execute("""
             INSERT INTO positions
             (stock_code, stock_name, cost_price, shares, position_pct, tier, updated_at)
@@ -240,6 +259,7 @@ class DecisionLog:
         return affected > 0
 
     def upsert_watchlist(self, data: dict) -> None:
+        # 自选股允许反复更新关注原因和提醒阈值，表示观察条件的演化。
         self.conn.execute("""
             INSERT INTO watchlist
             (stock_code, stock_name, reason, alert_yield, alert_pe_pct, added_at)
@@ -336,6 +356,7 @@ class EpisodicMemory:
         meta = {**(metadata or {}), "saved_at": now}
 
         # 1. 写入 ChromaDB（自动生成 embedding 向量）
+        # 向量库负责“意思相近也能找回”，例如用户换一种说法问同一类投资判断。
         with console_timer("记忆写入", "ChromaDB add"):
             self.collection.add(
                 documents=[text],
@@ -344,6 +365,7 @@ class EpisodicMemory:
             )
 
         # 2. 写入 SQLite episodic_docs 表
+        # SQLite 保存原文和元数据，作为向量命中后的可审计文本来源。
         with console_timer("记忆写入", "SQLite episodic_docs"):
             self.conn.execute("""
                 INSERT INTO episodic_docs (doc_id, text, metadata, created_at)
@@ -351,6 +373,7 @@ class EpisodicMemory:
             """, (doc_id, text, json.dumps(meta, ensure_ascii=False), now))
 
         # 3. 更新 FTS5 索引（存分词后的文本，便于中文检索）
+        # FTS5 弥补向量检索对股票代码、数字阈值、精确术语不敏感的问题。
         rowid = self.conn.execute(
             "SELECT id FROM episodic_docs WHERE doc_id=?", (doc_id,)
         ).fetchone()[0]
@@ -393,6 +416,8 @@ class EpisodicMemory:
     @staticmethod
     def _rerank_candidates(query: str, candidates: list[dict],
                            top_k: int = 4) -> list[dict]:
+        # RRF 先做稳健召回，再 rerank 精排；
+        # 默认轻量词面排序，只有显式打开 RERANK_ENABLED 才加载重模型。
         if os.environ.get("RERANK_ENABLED", "").lower() in ("1", "true", "yes", "on"):
             return EpisodicMemory._model_rerank_candidates(query, candidates, top_k)
         return EpisodicMemory._lexical_rerank_candidates(query, candidates, top_k)
@@ -454,11 +479,10 @@ class EpisodicMemory:
     @staticmethod
     def _lexical_rerank_candidates(query: str, candidates: list[dict],
                                    top_k: int = 4) -> list[dict]:
-        """Rerank RRF candidates by direct query/document lexical fit.
+        """按查询词与候选文本的直接重合度精排 RRF 结果。
 
-        RRF remains the prior, so when lexical evidence is weak the original
-        vector+FTS rank stays stable. This keeps reranking deterministic and
-        avoids introducing another model dependency in Docker.
+        RRF 仍是主先验：当词面证据不足时，向量+FTS 的原始融合排序保持稳定。
+        这让默认检索结果可重复，也避免 Docker 运行时强依赖额外 rerank 模型。
         """
         query_tokens = EpisodicMemory._token_set(query)
         query_lower = (query or "").strip().lower()
@@ -477,6 +501,8 @@ class EpisodicMemory:
             if query_lower and query_lower in text.lower():
                 lexical_score = min(1.0, lexical_score + 0.25)
 
+            # 70% 保留混合召回排序，30% 奖励词面命中；
+            # 这个权重偏保守，防止短关键词把语义相关结果挤掉。
             rrf_score = c["rrf_score"] / max_rrf
             rerank_score = 0.70 * rrf_score + 0.30 * lexical_score
             reranked.append({
@@ -529,6 +555,7 @@ class EpisodicMemory:
         # ── 路3：RRF 融合（K=60）──
         with console_timer("记忆检索", f"RRF fuse vec={len(vec_ids)} fts={len(fts_ids)}"):
             scores = self._rrf_score_map(vec_ids, fts_ids, k=60)
+            # 先保留一个比 top_k 更大的候选池，再做 rerank，避免过早丢掉有用记忆。
             rerank_pool_ids = sorted(scores, key=lambda x: scores[x], reverse=True)[
                 :min(len(scores), max(RERANK_POOL_SIZE, top_k))
             ]
@@ -570,6 +597,9 @@ class MemoryManager:
         self.episodic = EpisodicMemory()
 
     def retrieve_context(self, user_query: str) -> str:
+        # 给 Agent 的上下文由两类历史组成：
+        # 1. episodic 洞察：适合找相似讨论和用户偏好；
+        # 2. decisions 日志：适合追溯明确保存过的投资判断。
         with console_timer("上下文构建", "episodic hybrid retrieve"):
             fragments = self.episodic.retrieve(user_query, n_results=8, top_k=4)
         with console_timer("上下文构建", "SQLite decisions search"):

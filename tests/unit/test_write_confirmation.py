@@ -38,9 +38,22 @@ class FakeLLM:
 
     def chat(self, messages, tools, system):
         self.tool_counts.append(len(tools or []))
+        self.system = system
         if not tools:
             return LLMResponse(text="")
         return self.response
+
+
+class SequenceLLM:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.tool_counts = []
+        self.systems = []
+
+    def chat(self, messages, tools, system):
+        self.tool_counts.append(len(tools or []))
+        self.systems.append(system)
+        return self.responses.pop(0)
 
 
 def _make_agent(llm, memory):
@@ -137,6 +150,58 @@ def test_realtime_query_uses_read_tools_and_skips_memory(monkeypatch):
     assert out == "ok"
     assert llm.tool_counts[0] == len(READ_TOOLS)
     assert memory.retrieve_count == 0
+
+
+def test_analysis_query_keeps_full_read_tools_for_two_read_rounds(monkeypatch):
+    monkeypatch.delenv("AGENT_READ_TOOL_ROUNDS", raising=False)
+    decisions = FakeDecisions()
+    memory = FakeMemory(decisions)
+    llm = SequenceLLM([
+        LLMResponse(text=None, tool_calls=[
+            ToolCall(id="call_1", name="get_positions", input={}),
+        ]),
+        LLMResponse(text=None, tool_calls=[
+            ToolCall(id="call_2", name="get_watchlist", input={}),
+        ]),
+        LLMResponse(text="final answer"),
+    ])
+    agent = _make_agent(llm, memory)
+
+    out = agent.chat("比较 600900 和 601088 的 PE 股息率")
+
+    assert out == "final answer"
+    assert llm.tool_counts == [len(READ_TOOLS), len(READ_TOOLS), 0]
+
+
+def test_analysis_query_can_finalize_after_one_read_round(monkeypatch):
+    monkeypatch.setenv("AGENT_READ_TOOL_ROUNDS", "1")
+    decisions = FakeDecisions()
+    memory = FakeMemory(decisions)
+    llm = SequenceLLM([
+        LLMResponse(text=None, tool_calls=[
+            ToolCall(id="call_1", name="get_positions", input={}),
+        ]),
+        LLMResponse(text="final answer"),
+    ])
+    agent = _make_agent(llm, memory)
+
+    out = agent.chat("比较 600900 和 601088 的 PE 股息率")
+
+    assert out == "final answer"
+    assert llm.tool_counts == [len(READ_TOOLS), 0]
+
+
+def test_system_prompt_includes_read_tool_budget(monkeypatch):
+    monkeypatch.setenv("AGENT_READ_TOOL_ROUNDS", "2")
+    decisions = FakeDecisions()
+    memory = FakeMemory(decisions)
+    llm = FakeLLM(LLMResponse(text="ok"))
+    agent = _make_agent(llm, memory)
+
+    agent.chat("比较 600900 和 601088 的 PE 股息率")
+
+    assert "最多只有 2 轮读工具机会" in llm.system
+    assert "第一轮应尽量一次性并行调用所有必要读工具" in llm.system
 
 
 def test_write_intent_exposes_write_tools_but_still_stages_call():
