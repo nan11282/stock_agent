@@ -16,9 +16,24 @@ class CompactLLM:
         return LLMResponse(text=self.response_text)
 
 
+class FakeEpisodic:
+    def __init__(self):
+        self.saved = []
+
+    def save_insight(self, text, metadata=None):
+        self.saved.append({"text": text, "metadata": metadata or {}})
+        return f"doc-{len(self.saved)}"
+
+
+class FakeMemory:
+    def __init__(self):
+        self.episodic = FakeEpisodic()
+
+
 def _agent(llm=None):
     agent = Agent.__new__(Agent)
     agent.llm = llm or CompactLLM()
+    agent.memory = FakeMemory()
     agent.history = []
     agent.history_summary = None
     agent.pending_write_calls = []
@@ -45,6 +60,7 @@ def test_short_memory_does_not_compact_below_threshold(monkeypatch):
 
 
 def test_short_memory_compacts_old_turns_and_keeps_recent_window(monkeypatch):
+    monkeypatch.setenv("ASYNC_MEMORY_WRITE", "false")
     monkeypatch.setenv("SHORT_MEMORY_MAX_CHARS", "100")
     monkeypatch.setenv("SHORT_MEMORY_KEEP_TURNS", "4")
     monkeypatch.setenv("SHORT_MEMORY_SUMMARY_MAX_CHARS", "3000")
@@ -64,6 +80,10 @@ def test_short_memory_compacts_old_turns_and_keeps_recent_window(monkeypatch):
     ]
     assert "问题0" in llm.calls[0]["messages"][0].text
     assert llm.calls[0]["tools"] == []
+    assert agent.memory.episodic.saved == [{
+        "text": "保留用户偏好：偏高股息；早期讨论过600000。",
+        "metadata": {"source": "auto_compact"},
+    }]
 
 
 def test_history_for_llm_prepends_summary_without_mutating_history():
@@ -81,6 +101,7 @@ def test_history_for_llm_prepends_summary_without_mutating_history():
 
 
 def test_short_memory_keeps_tool_call_and_result_together(monkeypatch):
+    monkeypatch.setenv("ASYNC_MEMORY_WRITE", "false")
     monkeypatch.setenv("SHORT_MEMORY_MAX_CHARS", "100")
     monkeypatch.setenv("SHORT_MEMORY_KEEP_TURNS", "4")
     llm = CompactLLM()
@@ -116,6 +137,7 @@ def test_short_memory_keeps_tool_call_and_result_together(monkeypatch):
 
 
 def test_short_memory_merges_existing_summary(monkeypatch):
+    monkeypatch.setenv("ASYNC_MEMORY_WRITE", "false")
     monkeypatch.setenv("SHORT_MEMORY_MAX_CHARS", "100")
     monkeypatch.setenv("SHORT_MEMORY_KEEP_TURNS", "4")
     llm = CompactLLM("新旧合并后的摘要")
@@ -130,7 +152,8 @@ def test_short_memory_merges_existing_summary(monkeypatch):
     assert "旧摘要：用户只接受低估值买入。" in llm.calls[0]["messages"][0].text
 
 
-def test_reset_clears_short_memory_summary():
+def test_reset_saves_session_summary_then_clears_state(monkeypatch):
+    monkeypatch.setenv("ASYNC_MEMORY_WRITE", "false")
     agent = _agent()
     _add_turn(agent, 1)
     agent.history_summary = "旧摘要"
@@ -141,3 +164,18 @@ def test_reset_clears_short_memory_summary():
     assert agent.history == []
     assert agent.history_summary is None
     assert agent.pending_write_calls == []
+    assert agent.memory.episodic.saved == [{
+        "text": "压缩后的摘要",
+        "metadata": {"source": "manual_reset"},
+    }]
+
+
+def test_reset_without_session_does_not_write_memory(monkeypatch):
+    monkeypatch.setenv("ASYNC_MEMORY_WRITE", "false")
+    agent = _agent()
+
+    agent.reset()
+
+    assert agent.history == []
+    assert agent.history_summary is None
+    assert agent.memory.episodic.saved == []

@@ -10,6 +10,7 @@ import os
 import traceback
 
 from agent import Agent
+from adapters import LLMTimeoutError
 from runtime import build_default_llm
 
 try:
@@ -38,7 +39,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _chat_timeout_seconds() -> int:
-    return max(1, _env_int("TELEGRAM_CHAT_TIMEOUT_SECONDS", 300))
+    return max(1, _env_int("TELEGRAM_CHAT_TIMEOUT_SECONDS", 900))
 
 
 def _telegram_connection_pool_size() -> int:
@@ -178,6 +179,12 @@ async def _handle_message(update, context):
         response = (
             f"[分析超时] 本轮处理超过 {timeout} 秒，已停止等待并重置本轮会话。"
             "可以把问题拆短一点，或稍后再试。"
+        )
+    except LLMTimeoutError as e:
+        print(f"[TelegramBot] LLM 超时 chat_id={chat_id}: {e}")
+        response = (
+            "[分析超时] 上游模型响应超过当前 LLM_TIMEOUT_SECONDS 限制。"
+            "这不是 Telegram 发送失败；可以稍后重试，或把 LLM_TIMEOUT_SECONDS 调大。"
         )
     except Exception as e:
         print(f"[TelegramBot] 处理消息失败 chat_id={chat_id}: {e}")

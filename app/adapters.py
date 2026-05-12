@@ -60,6 +60,10 @@ class LLMAdapter(ABC):
         ...
 
 
+class LLMTimeoutError(TimeoutError):
+    """Raised when the upstream LLM provider does not return within the request timeout."""
+
+
 # ─────────────────────────────────────────────
 # Claude Adapter
 # ─────────────────────────────────────────────
@@ -211,13 +215,20 @@ class OpenAIAdapter(LLMAdapter):
             for t in tools
         ] if tools else None
 
-        with console_timer("LLM API", f"model={self.model} messages={len(full_messages)} tools={len(tools or [])}"):
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=full_messages,
-                tools=oai_tools,
-                timeout=self.timeout,
-            )
+        try:
+            with console_timer("LLM API", f"model={self.model} messages={len(full_messages)} tools={len(tools or [])}"):
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=full_messages,
+                    tools=oai_tools,
+                    timeout=self.timeout,
+                )
+        except Exception as e:
+            if _is_timeout_exception(e):
+                raise LLMTimeoutError(
+                    f"LLM request timed out after {self.timeout.read:g} seconds"
+                ) from e
+            raise
 
         msg = resp.choices[0].message
         tool_calls = []
@@ -239,6 +250,27 @@ class OpenAIAdapter(LLMAdapter):
             stop_reason="tool_use" if tool_calls else "end_turn",
             reasoning_content=reasoning,
         )
+
+
+def _is_timeout_exception(exc: Exception) -> bool:
+    timeout_names = {
+        "APITimeoutError",
+        "TimeoutException",
+        "ReadTimeout",
+        "ConnectTimeout",
+        "PoolTimeout",
+        "WriteTimeout",
+        "TimeoutError",
+    }
+    if type(exc).__name__ in timeout_names:
+        return True
+
+    cause = exc.__cause__
+    if cause is not None and type(cause).__name__ in timeout_names:
+        return True
+
+    message = str(exc).lower()
+    return "timed out" in message or "timeout" in message
 
 
 # 切换示例：

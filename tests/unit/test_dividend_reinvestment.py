@@ -1,9 +1,10 @@
 import json
+import pytest
 from types import SimpleNamespace
 
 import pandas as pd
 
-from adapters import OpenAIAdapter
+from adapters import LLMTimeoutError, Message, OpenAIAdapter
 from agent import Agent
 from tools import (
     ToolExecutor,
@@ -115,7 +116,6 @@ def test_agent_directly_answers_dividend_reinvestment_without_llm():
     agent.executor = FakeExecutor()
     agent.history = []
     agent.pending_write_calls = []
-    agent._save_conversation_insight_after_response = lambda *args: None
 
     out = agent.chat("为我计算一下 如果每个月定投工商银行3手 股息复投 三十年后 我的股息总收益是多少 当年的股息是多少")
 
@@ -137,3 +137,30 @@ def test_openai_adapter_uses_explicit_httpx_timeout():
     assert adapter.timeout.read == 60.0
     assert adapter.timeout.write == 10.0
     assert adapter.timeout.pool == 10.0
+
+
+def test_openai_adapter_wraps_provider_timeout():
+    adapter = OpenAIAdapter(
+        model="deepseek-v4-pro",
+        base_url="https://api.deepseek.com",
+        api_key="test-key",
+        timeout=180,
+        max_retries=0,
+    )
+
+    class TimeoutCompletions:
+        def create(self, **kwargs):
+            raise TimeoutError("Request timed out.")
+
+    adapter.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=TimeoutCompletions(),
+        ),
+    )
+
+    with pytest.raises(LLMTimeoutError, match="180 seconds"):
+        adapter.chat(
+            messages=[Message(role="user", text="hello")],
+            tools=[],
+            system="system",
+        )

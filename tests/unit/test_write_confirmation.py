@@ -1,6 +1,4 @@
 import json
-import time
-from threading import Event
 
 from adapters import LLMResponse, ToolCall
 from agent import Agent
@@ -63,8 +61,8 @@ def _make_agent(llm, memory):
     agent.executor = ToolExecutor(memory)
     agent.max_steps = 5
     agent.history = []
+    agent.history_summary = None
     agent.pending_write_calls = []
-    agent._save_conversation_insight = lambda *args: None
     return agent
 
 
@@ -250,24 +248,15 @@ def test_memory_policy_always_forces_retrieval(monkeypatch):
     assert memory.retrieve_count == 1
 
 
-def test_async_memory_write_does_not_block_chat(monkeypatch):
-    monkeypatch.setenv("ASYNC_MEMORY_WRITE", "true")
+def test_chat_does_not_write_long_term_memory_each_turn():
     decisions = FakeDecisions()
     memory = FakeMemory(decisions)
     llm = FakeLLM(LLMResponse(text="ok"))
     agent = _make_agent(llm, memory)
-    saved = Event()
+    calls = []
+    agent._save_session_summary_after_boundary = lambda *args, **kwargs: calls.append((args, kwargs))
 
-    def slow_save(*args):
-        time.sleep(0.2)
-        saved.set()
-
-    agent._save_conversation_insight = slow_save
-
-    start = time.monotonic()
     out = agent.chat("比较 600900 和 601088 的 PE 股息率")
-    elapsed = time.monotonic() - start
 
     assert out == "ok"
-    assert elapsed < 0.15
-    assert saved.wait(1)
+    assert calls == []

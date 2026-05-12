@@ -438,6 +438,7 @@ class Agent:
             return
         self.history_summary = new_summary
         self.history = recent_messages
+        self._save_session_summary_after_boundary(new_summary, source="auto_compact")
 
     # ── 写工具确认 ───────────────────────────
 
@@ -505,48 +506,48 @@ class Agent:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 return list(pool.map(self._execute_read_tool_call, tool_calls))
 
-    # ── 对话后提炼摘要写入向量库+FTS5 ────────
+    # ── 会话边界摘要写入向量库+FTS5 ────────
 
-    def _save_conversation_insight(self, user_input: str, final_response: str):
-        # 长期记忆只保存“投资洞察摘要”，不保存完整聊天。
-        # 这样后续检索得到的是可复用判断，而不是噪声很大的对话文本。
-        summary_prompt = [
-            Message(role="user", text=(
-                f"请将以下这段投资对话总结成2-3句话，"
-                f"包含：讨论的股票代码和名称、核心观点、结论或待观察点。\n\n"
-                f"用户问：{user_input}\n"
-                f"助理答：{final_response[:500]}"
-            ))
-        ]
+    def _save_session_summary(self, summary: str, source: str):
+        text = (summary or "").strip()
+        if not text:
+            return
         try:
-            resp = self.llm.chat(
-                messages=summary_prompt,
-                tools=[],
-                system="你是一个投资记录助手，只输出简洁的摘要，不超过100字。",
+            self.memory.episodic.save_insight(
+                text=text,
+                metadata={"source": source},
             )
-            if resp.text:
-                self.memory.episodic.save_insight(
-                    text=resp.text,
-                    metadata={"source_query": user_input[:100]},
-                )
-                get_tracer().bump_memory_writes()
+            get_tracer().bump_memory_writes()
         except Exception as e:
             print(f"  [记忆写入失败] {e}")
 
-    def _save_conversation_insight_after_response(self, user_input: str, final_response: str):
+    def _save_session_summary_after_boundary(self, summary: str, source: str):
         async_enabled = os.environ.get("ASYNC_MEMORY_WRITE", "true").lower() not in (
             "0", "false", "no", "off"
         )
         if not async_enabled:
-            with console_timer("对话阶段", "对话摘要写入"):
-                self._save_conversation_insight(user_input, final_response)
+            with console_timer("对话阶段", f"会话摘要写入 source={source}"):
+                self._save_session_summary(summary, source)
             return
 
         def run():
-            with console_timer("对话阶段", "对话摘要写入 async"):
-                self._save_conversation_insight(user_input, final_response)
+            with console_timer("对话阶段", f"会话摘要写入 async source={source}"):
+                self._save_session_summary(summary, source)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _session_summary_for_reset(self) -> str | None:
+        summary = self._history_summary_text().strip()
+        if not summary and not self.history:
+            return None
+        if not self.history:
+            return summary
+        try:
+            new_summary = self._compact_history(self.history)
+        except Exception as e:
+            print(f"  [reset会话压缩失败] {e}")
+            return summary or None
+        return new_summary or summary or None
 
     # ── 主循环 ───────────────────────────────
 
@@ -559,7 +560,6 @@ class Agent:
                 self._append_user(user_input)
                 self._append_assistant(LLMResponse(text=pending_result))
                 tracer.set_history_end(self.history, pending_result)
-                self._save_conversation_insight_after_response(user_input, pending_result)
                 self._maybe_compact_history()
                 return pending_result
 
@@ -568,7 +568,6 @@ class Agent:
                 self._append_user(user_input)
                 self._append_assistant(LLMResponse(text=direct_result))
                 tracer.set_history_end(self.history, direct_result)
-                self._save_conversation_insight_after_response(user_input, direct_result)
                 self._maybe_compact_history()
                 return direct_result
 
@@ -620,12 +619,17 @@ class Agent:
                 final_text = f"[警告] 达到最大步数 {self.max_steps}，强制终止。"
 
             tracer.set_history_end(self.history, final_text)
-            self._save_conversation_insight_after_response(user_input, final_text)
             self._maybe_compact_history()
 
         return final_text
 
     def reset(self):
+        try:
+            summary = self._session_summary_for_reset()
+            if summary:
+                self._save_session_summary_after_boundary(summary, source="manual_reset")
+        except Exception as e:
+            print(f"  [reset会话摘要失败] {e}")
         self.history = []
         self.history_summary = None
         self.pending_write_calls = []

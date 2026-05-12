@@ -3,7 +3,9 @@ import threading
 from types import SimpleNamespace
 
 import telegram_bot
+from adapters import LLMTimeoutError
 from telegram_bot import (
+    _chat_timeout_seconds,
     _delete_message_safely,
     _handle_error,
     _handle_message,
@@ -59,6 +61,12 @@ def test_telegram_connection_settings_from_env(monkeypatch):
     assert _telegram_connection_pool_size() == 64
     assert _telegram_pool_timeout_seconds() == 45
     assert _telegram_connect_timeout_seconds() == 20
+
+
+def test_chat_timeout_default_allows_slow_reasoning(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_CHAT_TIMEOUT_SECONDS", raising=False)
+
+    assert _chat_timeout_seconds() == 900
 
 
 def test_telegram_connection_settings_fallback_to_safe_minimum(monkeypatch):
@@ -187,3 +195,33 @@ def test_handle_message_replies_when_agent_times_out(monkeypatch):
 
     assert message.replies[0] == "正在思考..."
     assert message.replies[1].startswith("[分析超时]")
+
+
+def test_handle_message_reports_llm_timeout_without_raw_exception(monkeypatch):
+    class FakeMessage:
+        text = "slow question"
+
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text):
+            self.replies.append(text)
+            return SimpleNamespace(delete=_noop_delete)
+
+    class ChatAgent:
+        def chat(self, text):
+            raise LLMTimeoutError("LLM request timed out after 180 seconds")
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=789),
+        message=message,
+    )
+
+    monkeypatch.setattr(telegram_bot, "_get_agent", lambda chat_id: ChatAgent())
+
+    asyncio.run(_handle_message(update, SimpleNamespace()))
+
+    assert message.replies[0] == "正在思考..."
+    assert message.replies[1].startswith("[分析超时]")
+    assert "Request timed out" not in message.replies[1]
