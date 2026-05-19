@@ -35,6 +35,7 @@ def test_projection_reinvests_only_whole_lots_and_carries_cash():
 
 def test_resolve_stock_code_maps_icbc_name():
     assert resolve_stock_code("每月定投工商银行3手") == "601398"
+    assert resolve_stock_code("把伊利加入自选") == "600887"
     assert resolve_stock_code("定投 600028 2手") == "600028"
 
 
@@ -71,6 +72,49 @@ def test_tool_calculate_dividend_reinvestment(monkeypatch):
     assert out["annual_dividend_per_share"] == 0.3
     assert out["dividend_source_date"] == "2025-07-01"
     assert out["cumulative_dividend"] == 3300.0
+
+
+def test_get_stock_data_does_not_sync_compute_pe_percentile_by_default(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "investment.db"))
+    monkeypatch.setattr("tools.fetch_tencent_quote", lambda stock_code: {
+        "name": "工商银行",
+        "price": 5.0,
+        "pe_ttm": "5",
+        "pb": "0.5",
+        "market_cap_bn": "1",
+        "52w_high": "6",
+        "52w_low": "4",
+    })
+    dividend_df = pd.DataFrame([
+        {"除权除息日": "2026-01-01", "派息": "3.0"},
+    ])
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "akshare",
+        SimpleNamespace(stock_history_dividend_detail=lambda **kwargs: dividend_df),
+    )
+
+    def fail_sync_compute(*args, **kwargs):
+        raise AssertionError("PE percentile should not be computed synchronously")
+
+    warmed = []
+    monkeypatch.setattr(ToolExecutor, "_compute_pe_percentile", fail_sync_compute)
+    monkeypatch.setattr(
+        ToolExecutor,
+        "_warm_pe_percentile_cache_async",
+        classmethod(lambda cls, stock_code, current_pe: warmed.append((stock_code, current_pe))),
+    )
+
+    executor = ToolExecutor(memory=None)
+    out = json.loads(executor.execute("get_stock_data", {"stock_code": "601398"}))
+
+    assert out["stock_code"] == "601398"
+    assert out["ttm_yield_pct"] == 6.0
+    assert out["pe_percentile_pct"] is None
+    assert "后台缓存" in out["pe_percentile_note"]
+    assert warmed == [("601398", 5.0)]
 
 
 def test_agent_directly_answers_dividend_reinvestment_without_llm():
@@ -164,3 +208,55 @@ def test_openai_adapter_wraps_provider_timeout():
             tools=[],
             system="system",
         )
+
+
+def test_openai_adapter_streams_text_chunks():
+    adapter = OpenAIAdapter(
+        model="deepseek-v4-pro",
+        base_url="https://api.deepseek.com",
+        api_key="test-key",
+        timeout=180,
+        max_retries=0,
+    )
+
+    class StreamingCompletions:
+        def __init__(self):
+            self.kwargs = None
+
+        def create(self, **kwargs):
+            self.kwargs = kwargs
+            return iter([
+                SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        delta=SimpleNamespace(content="分批"),
+                        finish_reason=None,
+                    )],
+                ),
+                SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        delta=SimpleNamespace(content="输出"),
+                        finish_reason=None,
+                    )],
+                ),
+                SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        delta=SimpleNamespace(content=None),
+                        finish_reason="stop",
+                    )],
+                ),
+            ])
+
+    completions = StreamingCompletions()
+    adapter.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions),
+    )
+
+    chunks = list(adapter.chat_stream(
+        messages=[Message(role="user", text="hello")],
+        tools=[],
+        system="system",
+    ))
+
+    assert completions.kwargs["stream"] is True
+    assert [chunk.text_delta for chunk in chunks if chunk.text_delta] == ["分批", "输出"]
+    assert chunks[-1].response.text == "分批输出"

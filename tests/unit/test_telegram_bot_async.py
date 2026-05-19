@@ -66,7 +66,7 @@ def test_telegram_connection_settings_from_env(monkeypatch):
 def test_chat_timeout_default_allows_slow_reasoning(monkeypatch):
     monkeypatch.delenv("TELEGRAM_CHAT_TIMEOUT_SECONDS", raising=False)
 
-    assert _chat_timeout_seconds() == 900
+    assert _chat_timeout_seconds() == 1800
 
 
 def test_telegram_connection_settings_fallback_to_safe_minimum(monkeypatch):
@@ -161,6 +161,82 @@ def test_handle_message_sends_thinking_before_agent_init(monkeypatch):
 
     assert events[:2] == ["reply:正在思考...", "get_agent"]
     assert events[-1] == "reply:done"
+
+
+def test_handle_message_edits_thinking_message_for_stream(monkeypatch):
+    class ThinkingMessage:
+        def __init__(self):
+            self.edits = []
+            self.deleted = False
+
+        async def edit_text(self, text):
+            self.edits.append(text)
+
+        async def delete(self):
+            self.deleted = True
+
+    class FakeMessage:
+        text = "hello"
+
+        def __init__(self):
+            self.replies = []
+            self.thinking = ThinkingMessage()
+
+        async def reply_text(self, text):
+            self.replies.append(text)
+            if text == "正在思考...":
+                return self.thinking
+            return SimpleNamespace(delete=_noop_delete)
+
+    class StreamingAgent:
+        def chat(self, text, on_text_delta=None):
+            on_text_delta("hello ")
+            on_text_delta("world")
+            return "hello world"
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=123),
+        message=message,
+    )
+
+    monkeypatch.setattr(telegram_bot, "_get_agent", lambda chat_id: StreamingAgent())
+
+    asyncio.run(_handle_message(update, SimpleNamespace()))
+
+    assert message.replies == ["正在思考..."]
+    assert message.thinking.edits[-1] == "hello world"
+    assert message.thinking.deleted is False
+
+
+def test_handle_message_clear_does_not_reset_or_send_thinking(monkeypatch):
+    events = []
+
+    class FakeMessage:
+        text = "/clear"
+
+        async def reply_text(self, text):
+            events.append(f"reply:{text}")
+            return SimpleNamespace(delete=_noop_delete)
+
+    class ChatAgent:
+        def clear(self):
+            events.append("clear")
+
+        def reset(self):
+            events.append("reset")
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=123),
+        message=message,
+    )
+
+    monkeypatch.setattr(telegram_bot, "_get_agent", lambda chat_id: ChatAgent())
+
+    asyncio.run(_handle_message(update, SimpleNamespace()))
+
+    assert events == ["clear", "reply:短期对话已清空（未写入长期记忆）"]
 
 
 def test_handle_message_replies_when_agent_times_out(monkeypatch):

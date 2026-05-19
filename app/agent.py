@@ -7,8 +7,9 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import Callable
 
-from adapters import LLMAdapter, LLMResponse, Message, ToolResult
+from adapters import LLMAdapter, LLMResponse, LLMStreamChunk, Message, ToolResult
 from tools import ToolExecutor, READ_TOOLS, WRITE_TOOLS, WRITE_TOOL_NAMES, resolve_stock_code
 from memory import MemoryManager
 from metrics import console_timer, get_tracer, history_chars
@@ -32,7 +33,11 @@ SYSTEM_PROMPT_TEMPLATE = """
 读工具：分析过程中自主调用，无需请示。
 读工具预算：本轮最多只有 {read_tool_rounds} 轮读工具机会。
 第一轮应尽量一次性并行调用所有必要读工具。
-第二轮只用于补漏，不要重复读取已经拿到的数据。
+默认只有一轮读工具；拿到工具结果后应直接总结，不要为了补漏重复读取已经拿到的数据。
+普通行情、估值、批量对比问题必须优先使用轻量行情：get_stock_data 默认不要同步计算 PE历史百分位。
+只有用户明确要求“PE历史分位/PE百分位/估值分位/完整估值”等完整数据时，才允许 include_pe_percentile=true。
+如果 PE历史分位缺失或显示后台缓存中，要照常给结论，并说明该增强数据未同步完成。
+当前持仓和自选股已经在 system prompt 中提供；除非用户明确要求刷新/列出，否则不要重复调用 get_positions/get_watchlist。
 工具机会用完后，必须基于已有数据回答；若关键数据缺失，要明确说明缺失项和影响。
 写工具：必须同时满足：
   1. 用户明确说了操作指令
@@ -46,10 +51,17 @@ SYSTEM_PROMPT_TEMPLATE = """
 
 
 WRITE_INTENT_TERMS = (
-    "保存", "存下来", "记录", "记一下", "保存决策",
+    "写入", "保存", "存下来", "记录", "记一下", "保存决策",
     "加入持仓", "更新持仓", "记录买入", "清仓", "删除持仓", "移除持仓",
-    "加入自选", "加到自选", "关注这只", "加到观察列表", "移出自选", "删除自选",
+    "加入自选", "加到自选", "写入自选", "关注这只",
+    "加入观察", "加到观察", "写入观察", "加入观察股", "写入观察股", "加到观察列表",
+    "移出自选", "删除自选",
     "保存复盘", "记录复盘",
+)
+
+WRITE_OFFER_TERMS = (
+    "确认后", "回复“确认”", '回复"确认"', "写入", "加入自选", "加到自选",
+    "添加到自选", "放进自选", "加入持仓", "保存", "记录",
 )
 
 # 这些词表是 Agent 的“业务路由器”：先用可解释规则判断用户是在复盘、
@@ -60,12 +72,20 @@ HISTORY_CONTEXT_TERMS = (
 )
 
 REALTIME_QUERY_TERMS = (
-    "行情", "现价", "当前", "今天", "估值", "pe", "pb",
+    "行情", "现价", "当前", "现在", "今天", "近期", "最新", "目前", "估值", "pe", "pb",
     "股息率", "分红", "比较", "对比",
 )
 
 STOCK_CONTEXT_TERMS = (
     "股票", "a股", "个股", "代码", "估值", "行情", "股息率", "分红", "pe", "pb",
+    "板块", "行业", "赛道", "半导体", "芯片", "市场",
+)
+
+SYNC_PE_PERCENTILE_TERMS = (
+    "pe历史分位", "pe历史百分位", "历史pe分位", "历史pe百分位",
+    "pe百分位", "pe分位", "pe 百分位", "pe 分位",
+    "历史分位", "历史百分位", "估值分位", "估值百分位",
+    "完整估值", "完整数据", "详细估值",
 )
 
 CHINESE_NUMBERS = {
@@ -142,8 +162,14 @@ class Agent:
                     alerts.append(f"股息率>{w['alert_yield']}%")
                 if w.get("alert_pe_pct"):
                     alerts.append(f"PE百分位<{w['alert_pe_pct']}")
+                if w.get("watch_price_below"):
+                    alerts.append(f"观察价<={w['watch_price_below']}")
+                if w.get("alert_price_below"):
+                    alerts.append(f"强提醒价<={w['alert_price_below']}")
                 if alerts:
                     line += f" 提醒: {', '.join(alerts)}"
+                if w.get("alert_note"):
+                    line += f" 复核: {w['alert_note']}"
                 parts.append(line)
 
         return "\n".join(parts) if parts else "暂无持仓和自选股"
@@ -175,6 +201,7 @@ class Agent:
         has_realtime_term = cls._contains_any(user_query, REALTIME_QUERY_TERMS)
         has_stock_context = (
             cls._has_stock_code(user_query)
+            or resolve_stock_code(user_query) is not None
             or cls._contains_any(user_query, STOCK_CONTEXT_TERMS)
         )
         if policy in ("conservative_skip", "skip_realtime") and has_realtime_term and has_stock_context:
@@ -183,16 +210,44 @@ class Agent:
         return True
 
     @classmethod
-    def _select_tools_for_turn(cls, user_query: str) -> list[dict]:
+    def _read_tools_for_turn(cls, user_query: str) -> list[dict]:
+        tools = list(READ_TOOLS)
+        if not cls._should_retrieve_memory(user_query):
+            tools = [tool for tool in tools if tool["name"] != "retrieve_memory"]
+        return tools
+
+    @classmethod
+    def _select_tools_for_turn(cls, user_query: str,
+                               include_write_tools: bool = False) -> list[dict]:
         # 写工具只在用户有明确保存/更新/删除意图时才暴露给 LLM。
         # 后续仍需二次确认，这里只是第一道业务权限门。
-        if cls._has_write_intent(user_query):
-            return READ_TOOLS + WRITE_TOOLS
-        return READ_TOOLS
+        read_tools = cls._read_tools_for_turn(user_query)
+        if include_write_tools or cls._has_write_intent(user_query):
+            return read_tools + WRITE_TOOLS
+        return read_tools
+
+    @classmethod
+    def _tools_after_read_round(cls, user_query: str, read_rounds_used: int,
+                                read_tool_round_limit: int,
+                                include_write_tools: bool = False) -> list[dict]:
+        write_tools = (
+            WRITE_TOOLS
+            if include_write_tools or cls._has_write_intent(user_query)
+            else []
+        )
+        if read_rounds_used >= read_tool_round_limit:
+            # 读预算只限制行情/记忆等外部读取；用户本轮明确要求写入时，
+            # 仍要允许 LLM 在看完读工具结果后提出待确认的写操作。
+            return write_tools
+        return cls._read_tools_for_turn(user_query) + write_tools
 
     @staticmethod
     def _read_tool_round_limit() -> int:
-        return max(0, _env_int("AGENT_READ_TOOL_ROUNDS", 2))
+        return max(0, _env_int("AGENT_READ_TOOL_ROUNDS", 1))
+
+    @classmethod
+    def _allows_sync_pe_percentile(cls, user_query: str) -> bool:
+        return cls._contains_any(user_query, SYNC_PE_PERCENTILE_TERMS)
 
     @classmethod
     def _is_dividend_reinvestment_query(cls, user_query: str) -> bool:
@@ -454,6 +509,23 @@ class Agent:
     def _write_tool_calls(tool_calls) -> list:
         return [tc for tc in tool_calls if tc.name in WRITE_TOOL_NAMES]
 
+    def _last_assistant_text(self) -> str:
+        for message in reversed(self.history):
+            if message.role == "assistant" and message.text:
+                return message.text
+        return ""
+
+    def _confirms_unstaged_write_offer(self, user_input: str) -> bool:
+        if not self._is_confirm(user_input):
+            return False
+        last_assistant_text = self._last_assistant_text()
+        if not last_assistant_text:
+            return False
+        return (
+            "确认" in last_assistant_text
+            and self._contains_any(last_assistant_text, WRITE_OFFER_TERMS)
+        )
+
     def _format_pending_write_confirmation(self, tool_calls) -> str:
         # 所有数据库写入都先转成可读清单给用户确认；
         # 这保护的是资金决策记录的审计性，而不是单纯防误触。
@@ -494,6 +566,24 @@ class Agent:
         print(f"  [工具调用] {tc.name}  参数={tc.input}")
         with console_timer("对话阶段", f"tool {tc.name}"):
             return self.executor.execute(tc.name, tc.input)
+
+    @classmethod
+    def _guard_read_tool_calls(cls, user_query: str, tool_calls) -> list:
+        if cls._allows_sync_pe_percentile(user_query):
+            return tool_calls
+
+        for tc in tool_calls:
+            if tc.name != "get_stock_data":
+                continue
+            tc.input = dict(tc.input or {})
+            if tc.input.get("include_pe_percentile"):
+                print(
+                    "  [工具参数保护] get_stock_data.include_pe_percentile=True "
+                    "已改为 False；普通对话走后台PE分位缓存"
+                )
+            tc.input["include_pe_percentile"] = False
+            tc.input["async_pe_percentile"] = True
+        return tool_calls
 
     def _execute_read_tool_calls(self, tool_calls) -> list[str]:
         if len(tool_calls) <= 1:
@@ -551,7 +641,37 @@ class Agent:
 
     # ── 主循环 ───────────────────────────────
 
-    def chat(self, user_input: str) -> str:
+    def _chat_with_optional_stream(
+        self,
+        messages: list[Message],
+        tools: list[dict],
+        system: str,
+        on_text_delta: Callable[[str], None] | None,
+    ) -> LLMResponse:
+        if on_text_delta is None or tools or not hasattr(self.llm, "chat_stream"):
+            response = self.llm.chat(messages, tools, system)
+            if on_text_delta is not None and not tools and response.text:
+                on_text_delta(response.text)
+            return response
+
+        final_response = None
+        for chunk in self.llm.chat_stream(messages, tools, system):
+            if not isinstance(chunk, LLMStreamChunk):
+                continue
+            if chunk.text_delta:
+                on_text_delta(chunk.text_delta)
+            if chunk.response is not None:
+                final_response = chunk.response
+
+        if final_response is None:
+            return LLMResponse(text="")
+        return final_response
+
+    def chat(
+        self,
+        user_input: str,
+        on_text_delta: Callable[[str], None] | None = None,
+    ) -> str:
         tracer = get_tracer()
 
         with tracer.turn(user_input, self.history):
@@ -575,7 +695,11 @@ class Agent:
             with console_timer("对话阶段", "构建system prompt"):
                 system = self._build_system_prompt(user_input)
             tracer.set_system_prompt(system)
-            active_tools = self._select_tools_for_turn(user_input)
+            include_write_tools = self._confirms_unstaged_write_offer(user_input)
+            active_tools = self._select_tools_for_turn(
+                user_input,
+                include_write_tools=include_write_tools,
+            )
             read_tool_round_limit = self._read_tool_round_limit()
             read_tool_rounds_used = 0
 
@@ -587,7 +711,12 @@ class Agent:
                 llm_history = self._history_for_llm()
                 with tracer.llm_call(system, llm_history) as llm_rec:
                     with console_timer("对话阶段", f"LLM step={steps}"):
-                        response = self.llm.chat(llm_history, active_tools, system)
+                        response = self._chat_with_optional_stream(
+                            llm_history,
+                            active_tools,
+                            system,
+                            on_text_delta,
+                        )
                     llm_rec.output_text_chars = len(response.text or "")
                     llm_rec.tool_calls_emitted = len(response.tool_calls)
 
@@ -597,6 +726,8 @@ class Agent:
                     self.pending_write_calls = write_calls
                     final_text = self._format_pending_write_confirmation(write_calls)
                     self._append_assistant(LLMResponse(text=final_text))
+                    if on_text_delta is not None:
+                        on_text_delta(final_text)
                     break
 
                 self._append_assistant(response)
@@ -605,15 +736,30 @@ class Agent:
                     final_text = response.text or ""
                     break
 
+                response.tool_calls = self._guard_read_tool_calls(
+                    user_input,
+                    response.tool_calls,
+                )
                 results = self._execute_read_tool_calls(response.tool_calls)
 
                 self._append_tool_results(response.tool_calls, results)
                 read_tool_rounds_used += 1
                 if read_tool_rounds_used >= read_tool_round_limit:
-                    # 读工具预算用完后收回工具，让模型基于已有证据给最终结论。
-                    active_tools = []
+                    # 读工具预算用完后收回读工具；若本轮有明确写意图，
+                    # 写工具仍保留为“待确认写入”入口。
+                    active_tools = self._tools_after_read_round(
+                        user_input,
+                        read_tool_rounds_used,
+                        read_tool_round_limit,
+                        include_write_tools=include_write_tools,
+                    )
                 else:
-                    active_tools = READ_TOOLS
+                    active_tools = self._tools_after_read_round(
+                        user_input,
+                        read_tool_rounds_used,
+                        read_tool_round_limit,
+                        include_write_tools=include_write_tools,
+                    )
 
             else:
                 final_text = f"[警告] 达到最大步数 {self.max_steps}，强制终止。"
@@ -634,3 +780,9 @@ class Agent:
         self.history_summary = None
         self.pending_write_calls = []
         print("对话已清空（记忆和数据库保留）")
+
+    def clear(self):
+        self.history = []
+        self.history_summary = None
+        self.pending_write_calls = []
+        print("短期对话已清空（未写入长期记忆）")

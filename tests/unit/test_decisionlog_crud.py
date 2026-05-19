@@ -1,6 +1,10 @@
 """DecisionLog CRUD 测试：用 :memory: SQLite，毫秒级跑完。"""
 
+import sqlite3
+
 import pytest
+
+from memory import DecisionLog
 
 
 def test_save_and_search_decision(fresh_decisionlog):
@@ -76,10 +80,15 @@ def test_watchlist_upsert_and_delete(fresh_decisionlog):
     log.upsert_watchlist({
         "stock_code": "601398", "stock_name": "工商银行",
         "reason": "高股息防御", "alert_yield": 6.0, "alert_pe_pct": 20,
+        "alert_price_below": 4.8, "watch_price_below": 5.1,
+        "alert_note": "等年报确认ROE",
     })
     items = log.get_watchlist()
     assert len(items) == 1
     assert items[0]["alert_yield"] == 6.0
+    assert items[0]["alert_price_below"] == 4.8
+    assert items[0]["watch_price_below"] == 5.1
+    assert items[0]["alert_note"] == "等年报确认ROE"
 
     log.delete_watchlist("601398")
     assert log.get_watchlist() == []
@@ -117,3 +126,29 @@ def test_scan_result_save(fresh_decisionlog):
 
     row = log.conn.execute("SELECT * FROM scan_results WHERE id=?", (rid,)).fetchone()
     assert row["signal"] == "alert"
+
+
+def test_decisionlog_init_error_includes_sqlite_path_diagnostics(monkeypatch, tmp_path):
+    class BrokenConn:
+        row_factory = None
+
+        def execute(self, *args, **kwargs):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        def executescript(self, *args, **kwargs):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("memory.sqlite3.connect", lambda *args, **kwargs: BrokenConn())
+
+    db_path = tmp_path / "investment_live.db"
+    with pytest.raises(RuntimeError) as exc:
+        DecisionLog(db_path=str(db_path))
+
+    msg = str(exc.value)
+    assert "SQLite数据库初始化失败" in msg
+    assert "unable to open database file" in msg
+    assert "db_path=" in msg
+    assert "parent_exists=True" in msg

@@ -28,14 +28,76 @@ DB_PATH = os.environ.get("DB_PATH", "./data/investment.db")
 CHROMA_PATH = os.environ.get("CHROMA_PATH", "./chroma_db")
 RERANK_MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-base")
 RERANK_POOL_SIZE = int(os.environ.get("RERANK_POOL_SIZE", "12"))
+SQLITE_JOURNAL_MODE = os.environ.get("SQLITE_JOURNAL_MODE", "DELETE").upper()
 
 
 def _enable_wal_safely(conn, label: str) -> None:
+    mode = SQLITE_JOURNAL_MODE
+    if mode not in {"DELETE", "WAL", "TRUNCATE", "PERSIST", "MEMORY", "OFF"}:
+        mode = "DELETE"
     try:
-        # WAL 允许读写并发，适合 Telegram 聊天和定时扫描同时访问同一个 SQLite 文件。
-        conn.execute("PRAGMA journal_mode=WAL")
+        # Docker Desktop 的 Windows bind mount 对 WAL/SHM 锁支持不稳定；
+        # 默认用 DELETE 保可用性，需要并发优化时可显式设 SQLITE_JOURNAL_MODE=WAL。
+        conn.execute(f"PRAGMA journal_mode={mode}")
     except sqlite3.OperationalError as e:
-        print(f"  [SQLite] WAL启用失败，降级继续 label={label}: {e}", flush=True)
+        print(
+            f"  [SQLite] journal_mode={mode} 启用失败，尝试 DELETE "
+            f"label={label}: {e}",
+            flush=True,
+        )
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+        except sqlite3.OperationalError as fallback_e:
+            print(
+                f"  [SQLite] DELETE journal降级失败 label={label}: {fallback_e}",
+                flush=True,
+            )
+
+
+def _sqlite_path_diagnostics(db_path: str) -> str:
+    if db_path == ":memory:":
+        return "db_path=:memory:"
+
+    abs_path = os.path.abspath(db_path)
+    parent = os.path.dirname(abs_path) or "."
+    checks = {
+        "db_path": db_path,
+        "abs_path": abs_path,
+        "cwd": os.getcwd(),
+        "parent": parent,
+        "parent_exists": os.path.isdir(parent),
+        "parent_writable": os.access(parent, os.W_OK) if os.path.isdir(parent) else False,
+        "db_exists": os.path.exists(abs_path),
+        "db_writable": os.access(abs_path, os.W_OK) if os.path.exists(abs_path) else None,
+    }
+    for suffix in ("-wal", "-shm"):
+        sidecar = abs_path + suffix
+        checks[f"{suffix}_exists"] = os.path.exists(sidecar)
+        checks[f"{suffix}_writable"] = (
+            os.access(sidecar, os.W_OK) if os.path.exists(sidecar) else None
+        )
+    return ", ".join(f"{key}={value}" for key, value in checks.items())
+
+
+def _ensure_sqlite_parent_writable(db_path: str) -> None:
+    if db_path == ":memory:":
+        return
+
+    parent = os.path.dirname(os.path.abspath(db_path)) or "."
+    os.makedirs(parent, exist_ok=True)
+    probe = os.path.join(parent, ".sqlite_write_probe")
+    try:
+        with open(probe, "a", encoding="utf-8"):
+            pass
+    except OSError as e:
+        raise RuntimeError(
+            f"SQLite数据库目录不可写: {e}; {_sqlite_path_diagnostics(db_path)}"
+        ) from e
+    finally:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
 
 
 # ─────────────────────────────────────────────
@@ -45,10 +107,21 @@ def _enable_wal_safely(conn, label: str) -> None:
 class DecisionLog:
     def __init__(self, db_path: str = None):
         db_path = db_path or DB_PATH
-        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        _ensure_sqlite_parent_writable(db_path)
+        try:
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        except sqlite3.Error as e:
+            raise RuntimeError(
+                f"SQLite数据库连接失败: {e}; {_sqlite_path_diagnostics(db_path)}"
+            ) from e
         self.conn.row_factory = sqlite3.Row
-        self._init_schema()
+        try:
+            self._init_schema()
+        except sqlite3.Error as e:
+            self.conn.close()
+            raise RuntimeError(
+                f"SQLite数据库初始化失败: {e}; {_sqlite_path_diagnostics(db_path)}"
+            ) from e
 
     def _init_schema(self):
         _enable_wal_safely(self.conn, "DecisionLog")
@@ -78,6 +151,9 @@ class DecisionLog:
                 reason       TEXT,
                 alert_yield  REAL,
                 alert_pe_pct REAL,
+                alert_price_below REAL,
+                watch_price_below REAL,
+                alert_note  TEXT,
                 added_at     TEXT NOT NULL
             );
 
@@ -132,7 +208,22 @@ class DecisionLog:
             CREATE VIRTUAL TABLE IF NOT EXISTS episodic_fts
                 USING fts5(text, doc_id UNINDEXED, content='episodic_docs', content_rowid='id')
         """)
+        self._ensure_watchlist_columns()
         self.conn.commit()
+
+    def _ensure_watchlist_columns(self):
+        existing = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(watchlist)").fetchall()
+        }
+        migrations = {
+            "alert_price_below": "ALTER TABLE watchlist ADD COLUMN alert_price_below REAL",
+            "watch_price_below": "ALTER TABLE watchlist ADD COLUMN watch_price_below REAL",
+            "alert_note": "ALTER TABLE watchlist ADD COLUMN alert_note TEXT",
+        }
+        for column, sql in migrations.items():
+            if column not in existing:
+                self.conn.execute(sql)
 
     # ── 读操作（Agent 可自主调用）────────────────
 
@@ -262,20 +353,27 @@ class DecisionLog:
         # 自选股允许反复更新关注原因和提醒阈值，表示观察条件的演化。
         self.conn.execute("""
             INSERT INTO watchlist
-            (stock_code, stock_name, reason, alert_yield, alert_pe_pct, added_at)
-            VALUES (?,?,?,?,?,?)
+            (stock_code, stock_name, reason, alert_yield, alert_pe_pct,
+             alert_price_below, watch_price_below, alert_note, added_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
             ON CONFLICT(stock_code) DO UPDATE SET
-                stock_name   = excluded.stock_name,
-                reason       = excluded.reason,
-                alert_yield  = excluded.alert_yield,
-                alert_pe_pct = excluded.alert_pe_pct,
-                added_at     = excluded.added_at
+                stock_name          = excluded.stock_name,
+                reason              = excluded.reason,
+                alert_yield         = excluded.alert_yield,
+                alert_pe_pct        = excluded.alert_pe_pct,
+                alert_price_below   = excluded.alert_price_below,
+                watch_price_below   = excluded.watch_price_below,
+                alert_note          = excluded.alert_note,
+                added_at            = excluded.added_at
         """, (
             data["stock_code"],
             data["stock_name"],
             data.get("reason"),
             data.get("alert_yield"),
             data.get("alert_pe_pct"),
+            data.get("alert_price_below"),
+            data.get("watch_price_below"),
+            data.get("alert_note"),
             datetime.now().isoformat(),
         ))
         self.conn.commit()
@@ -322,7 +420,7 @@ class EpisodicMemory:
     _cross_encoder_error: str | None = None
 
     def __init__(self, db_path: str = None, persist_dir: str = None):
-        import chromadb
+        import chromadb  # pyright: ignore[reportMissingImports]
 
         db_path = db_path or DB_PATH
         persist_dir = persist_dir or CHROMA_PATH
@@ -430,7 +528,7 @@ class EpisodicMemory:
             return None
 
         try:
-            from sentence_transformers import CrossEncoder
+            from sentence_transformers import CrossEncoder  # pyright: ignore[reportMissingImports]
 
             with console_timer("记忆检索", f"加载rerank模型 {RERANK_MODEL}"):
                 EpisodicMemory._cross_encoder = CrossEncoder(RERANK_MODEL)

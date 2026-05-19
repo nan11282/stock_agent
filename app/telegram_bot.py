@@ -6,7 +6,10 @@ LLM 自主调工具或闲聊，回复自动分段适配 Telegram 长度限制。
 """
 
 import asyncio
+import inspect
 import os
+import threading
+import time
 import traceback
 
 from agent import Agent
@@ -38,8 +41,18 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _chat_timeout_seconds() -> int:
-    return max(1, _env_int("TELEGRAM_CHAT_TIMEOUT_SECONDS", 900))
+    return max(1, _env_int("TELEGRAM_CHAT_TIMEOUT_SECONDS", 1800))
 
 
 def _telegram_connection_pool_size() -> int:
@@ -60,6 +73,14 @@ def _telegram_read_timeout_seconds() -> int:
 
 def _telegram_get_updates_pool_size() -> int:
     return max(1, _env_int("TELEGRAM_GET_UPDATES_POOL_SIZE", 8))
+
+
+def _telegram_stream_edit_interval_seconds() -> float:
+    return max(0.2, _env_float("TELEGRAM_STREAM_EDIT_INTERVAL_SECONDS", 1.0))
+
+
+def _telegram_stream_min_chars() -> int:
+    return max(20, _env_int("TELEGRAM_STREAM_MIN_CHARS", 80))
 
 
 def _get_llm():
@@ -90,10 +111,63 @@ def _discard_chat_state(chat_id: int) -> None:
     _agent_locks.pop(chat_id, None)
 
 
-async def _run_agent_chat(agent: Agent, text: str) -> str:
+def _agent_accepts_stream_callback(agent: Agent) -> bool:
+    try:
+        return "on_text_delta" in inspect.signature(agent.chat).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _call_agent_chat(agent: Agent, text: str, on_text_delta=None) -> str:
+    if on_text_delta is not None and _agent_accepts_stream_callback(agent):
+        return agent.chat(text, on_text_delta=on_text_delta)
+    return agent.chat(text)
+
+
+async def _run_agent_chat(agent: Agent, text: str, on_delta=None) -> str:
     # Agent.chat 是同步的，里面会访问行情、SQLite、ChromaDB 和 LLM；
     # 放到线程里执行，避免阻塞 python-telegram-bot 的事件循环。
-    return await asyncio.to_thread(agent.chat, text)
+    if on_delta is None:
+        return await asyncio.to_thread(_call_agent_chat, agent, text, None)
+
+    loop = asyncio.get_running_loop()
+    queue = asyncio.Queue()
+    stopped = threading.Event()
+
+    def put_event(kind: str, payload):
+        if stopped.is_set():
+            return
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, (kind, payload))
+        except RuntimeError:
+            pass
+
+    def emit(delta: str):
+        if delta:
+            put_event("delta", delta)
+
+    def run():
+        try:
+            response = _call_agent_chat(agent, text, emit)
+            put_event("done", response)
+        except BaseException as e:
+            put_event("error", e)
+
+    worker = asyncio.create_task(asyncio.to_thread(run))
+    try:
+        while True:
+            kind, payload = await queue.get()
+            if kind == "delta":
+                await on_delta(payload)
+                continue
+            if kind == "error":
+                raise payload
+            await worker
+            return payload
+    finally:
+        if not worker.done():
+            stopped.set()
+            worker.cancel()
 
 
 async def _delete_message_safely(message) -> None:
@@ -102,6 +176,18 @@ async def _delete_message_safely(message) -> None:
         await message.delete()
     except TelegramError as e:
         print(f"[TelegramBot] 删除思考提示失败，已忽略: {e}")
+
+
+async def _edit_message_safely(message, text: str) -> bool:
+    edit_text = getattr(message, "edit_text", None)
+    if edit_text is None:
+        return False
+    try:
+        await edit_text(text)
+        return True
+    except TelegramError as e:
+        print(f"[TelegramBot] 编辑流式回复失败，已忽略: {e}")
+        return False
 
 
 async def _handle_error(update, context) -> None:
@@ -140,6 +226,13 @@ def _split_long_message(text: str, limit: int = 4000) -> list[str]:
     return parts or [text[:limit]]
 
 
+def _stream_preview(text: str, limit: int = 3900) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit - 12].rstrip() + "\n...[输出中]"
+
+
 async def _handle_message(update, context):
     """Telegram 消息入口。"""
     chat_id = update.effective_chat.id
@@ -150,12 +243,18 @@ async def _handle_message(update, context):
 
     print(f"[TelegramBot] 收到消息 chat_id={chat_id} chars={len(text)}")
 
-    # /reset 清空对话
+    # /reset 结束会话并沉淀摘要；/clear 只清短期上下文。
     if text.strip().lower() in ("/reset", "reset"):
-        # reset 只清短期会话，不清持仓、自选、决策日志和长期洞察。
+        # reset 会先把当前短期会话摘要写入长期记忆，再清空短期上下文。
         agent = _get_agent(chat_id)
         agent.reset()
-        await update.message.reply_text("对话已清空（记忆和数据库保留）")
+        await update.message.reply_text("对话已清空，并已沉淀会话摘要（数据库和持仓记录保留）")
+        return
+    if text.strip().lower() in ("/clear", "clear"):
+        # clear 是纯粹的上下文丢弃：不写长期记忆，不改持仓/自选/决策库。
+        agent = _get_agent(chat_id)
+        agent.clear()
+        await update.message.reply_text("短期对话已清空（未写入长期记忆）")
         return
 
     # 先发送思考提示，再做 Agent/DB/Chroma 初始化，避免用户端无反馈。
@@ -167,12 +266,42 @@ async def _handle_message(update, context):
         print(f"[TelegramBot] 发送思考提示失败 chat_id={chat_id}: {e}")
 
     agent = _get_agent(chat_id)
+    streamed_parts = []
+    last_stream_edit_at = 0.0
+    last_stream_preview = ""
+
+    async def publish_delta(delta: str):
+        nonlocal last_stream_edit_at, last_stream_preview
+        streamed_parts.append(delta)
+        if thinking_msg is None:
+            return
+
+        preview = _stream_preview("".join(streamed_parts))
+        if not preview or preview == last_stream_preview:
+            return
+
+        now = time.monotonic()
+        enough_time = now - last_stream_edit_at >= _telegram_stream_edit_interval_seconds()
+        enough_chars = len(preview) - len(last_stream_preview) >= _telegram_stream_min_chars()
+        if last_stream_preview and not (enough_time or enough_chars):
+            return
+
+        if await _edit_message_safely(thinking_msg, preview):
+            last_stream_edit_at = now
+            last_stream_preview = preview
 
     try:
         timeout = _chat_timeout_seconds()
         async with _get_lock(chat_id):
             # 同一个用户的消息串行处理，避免“确认写入”和新问题交错导致状态错乱。
-            response = await asyncio.wait_for(_run_agent_chat(agent, text), timeout=timeout)
+            try:
+                chat_task = _run_agent_chat(agent, text, on_delta=publish_delta)
+            except TypeError:
+                chat_task = _run_agent_chat(agent, text)
+            response = await asyncio.wait_for(
+                chat_task,
+                timeout=timeout,
+            )
     except asyncio.TimeoutError:
         # 超时后丢弃该 chat 的短期 Agent 状态，防止下一轮继续沿用半完成的工具/确认上下文。
         _discard_chat_state(chat_id)
@@ -190,10 +319,20 @@ async def _handle_message(update, context):
         print(f"[TelegramBot] 处理消息失败 chat_id={chat_id}: {e}")
         response = f"[分析出错] {e}"
 
-    # 删除思考提示，分段发送回复
+    # 删除/复用思考提示，分段发送回复。流式时优先把首段落编辑到原消息里，避免重复刷屏。
+    first_part_already_sent = False
     if thinking_msg is not None:
-        await _delete_message_safely(thinking_msg)
-    for part in _split_long_message(response):
+        streamed_text = "".join(streamed_parts).strip()
+        parts = _split_long_message(response)
+        if streamed_text and streamed_text == (response or "").strip():
+            first_part_already_sent = await _edit_message_safely(thinking_msg, parts[0])
+            if first_part_already_sent:
+                print(f"[TelegramBot] 已编辑最终首段 chat_id={chat_id} chars={len(parts[0])}")
+        if not first_part_already_sent:
+            await _delete_message_safely(thinking_msg)
+
+    parts = _split_long_message(response)
+    for part in parts[1 if first_part_already_sent else 0:]:
         try:
             await update.message.reply_text(part)
             print(f"[TelegramBot] 已发送回复 chat_id={chat_id} chars={len(part)}")
@@ -218,6 +357,7 @@ def start_bot():
     connect_timeout = _telegram_connect_timeout_seconds()
     read_timeout = _telegram_read_timeout_seconds()
     get_updates_pool_size = _telegram_get_updates_pool_size()
+    chat_timeout = _chat_timeout_seconds()
 
     builder = (
         Application.builder()
@@ -243,6 +383,7 @@ def start_bot():
         "[TelegramBot] 已启动 — 事件驱动长轮询 "
         f"connection_pool_size={pool_size} "
         f"get_updates_pool_size={get_updates_pool_size} "
+        f"chat_timeout={chat_timeout}s "
         f"pool_timeout={pool_timeout}s "
         f"connect_timeout={connect_timeout}s "
         f"read_timeout={read_timeout}s"

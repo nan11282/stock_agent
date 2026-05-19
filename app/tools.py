@@ -15,6 +15,8 @@ from datetime import date, datetime
 from memory import DB_PATH, MemoryManager, _enable_wal_safely
 from metrics import console_timer, get_tracer
 
+PE_PERCENTILE_YEARS = 3
+
 
 # ─────────────────────────────────────────────
 # Tool Schema（传给 LLM 的格式）
@@ -41,11 +43,19 @@ READ_TOOLS = [
     },
     {
         "name": "get_stock_data",
-        "description": "获取A股实时行情与估值：当前价格、PE、PB、TTM股息率、PE历史百分位（当前PE在近10年中的分位，越低越便宜）。Agent可自主调用。",
+        "description": "获取A股实时行情与估值：当前价格、PE、PB、TTM股息率、PE历史百分位（当前PE在近3年中的分位，越低越便宜）。Agent可自主调用。",
         "input_schema": {
             "type": "object",
             "properties": {
                 "stock_code": {"type": "string", "description": "6位股票代码，如 600028"},
+                "include_pe_percentile": {
+                    "type": "boolean",
+                    "description": "是否同步计算PE历史百分位；默认false以避免AKShare慢接口导致超时。用户明确要求历史分位时再设为true。",
+                },
+                "async_pe_percentile": {
+                    "type": "boolean",
+                    "description": "include_pe_percentile=false且缓存未命中时，是否后台预热PE历史百分位缓存；默认true。",
+                },
             },
             "required": ["stock_code"],
         },
@@ -256,6 +266,18 @@ WRITE_TOOLS = [
                 "reason":        {"type": "string", "description": "关注原因"},
                 "alert_yield":   {"type": "number", "description": "股息率触发阈值(%)，达到即提醒"},
                 "alert_pe_pct":  {"type": "number", "description": "PE百分位触发阈值，低于即提醒"},
+                "alert_price_below": {
+                    "type": "number",
+                    "description": "强提醒价格阈值，现价低于或等于该价格时提醒",
+                },
+                "watch_price_below": {
+                    "type": "number",
+                    "description": "观察价格阈值，现价低于或等于该价格时开始留意",
+                },
+                "alert_note": {
+                    "type": "string",
+                    "description": "基本面、财报或其他人工复核提醒，例如等待年报落地后关注ROE和营收增速",
+                },
             },
             "required": ["stock_code", "stock_name"],
         },
@@ -285,6 +307,10 @@ WRITE_TOOL_NAMES = {tool["name"] for tool in WRITE_TOOLS}
 STOCK_NAME_ALIASES = {
     "工商银行": "601398",
     "工行": "601398",
+    "格力电器": "000651",
+    "格力": "000651",
+    "伊利股份": "600887",
+    "伊利": "600887",
 }
 
 
@@ -419,6 +445,8 @@ def calculate_dividend_reinvestment_projection(
 
 class ToolExecutor:
     _pe_cache_lock = threading.Lock()
+    _pe_cache_warming: set[str] = set()
+    _pe_cache_warming_lock = threading.Lock()
 
     def __init__(self, memory: MemoryManager):
         self.memory = memory
@@ -466,27 +494,32 @@ class ToolExecutor:
     @classmethod
     def _init_pe_cache(cls):
         db_path = cls._pe_cache_db_path()
-        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        with cls._pe_cache_lock:
-            conn = sqlite3.connect(db_path, timeout=30)
-            try:
-                _enable_wal_safely(conn, "pe_percentile_cache")
-                # PE历史百分位的原始历史PE按交易日缓存。
-                # 当天多次问同一只股票时，只用当前PE重新算分位，避免反复拉10年数据。
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS pe_percentile_cache (
-                        stock_code           TEXT PRIMARY KEY,
-                        trade_date           TEXT NOT NULL,
-                        pe_history           TEXT NOT NULL,
-                        pe_percentile_years  INTEGER NOT NULL,
-                        pe_percentile_lo     REAL NOT NULL,
-                        pe_percentile_hi     REAL NOT NULL,
-                        updated_at           TEXT NOT NULL
-                    )
-                """)
-                conn.commit()
-            finally:
-                conn.close()
+        try:
+            os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+            with cls._pe_cache_lock:
+                conn = sqlite3.connect(db_path, timeout=30)
+                try:
+                    _enable_wal_safely(conn, "pe_percentile_cache")
+                    # PE历史百分位的原始历史PE按交易日缓存。
+                    # 当天多次问同一只股票时，只用当前PE重新算分位，避免反复拉远端数据。
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS pe_percentile_cache (
+                            stock_code           TEXT PRIMARY KEY,
+                            trade_date           TEXT NOT NULL,
+                            pe_history           TEXT NOT NULL,
+                            pe_percentile_years  INTEGER NOT NULL,
+                            pe_percentile_lo     REAL NOT NULL,
+                            pe_percentile_hi     REAL NOT NULL,
+                            updated_at           TEXT NOT NULL
+                        )
+                    """)
+                    conn.commit()
+                finally:
+                    conn.close()
+        except sqlite3.Error as e:
+            print(f"  [PE缓存] 初始化失败，降级为无缓存模式: {e}", flush=True)
+        except OSError as e:
+            print(f"  [PE缓存] 初始化目录失败，降级为无缓存模式: {e}", flush=True)
 
     @staticmethod
     def _percentile_from_history(current_pe: float, historical_pes: list[float]) -> dict:
@@ -505,21 +538,27 @@ class ToolExecutor:
     @classmethod
     def _load_cached_pe_percentile(cls, stock_code: str, current_pe: float) -> dict | None:
         today = date.today().isoformat()
-        with cls._pe_cache_lock:
-            conn = sqlite3.connect(cls._pe_cache_db_path(), timeout=30)
-            conn.row_factory = sqlite3.Row
-            try:
-                row = conn.execute(
-                    """
-                    SELECT pe_history FROM pe_percentile_cache
-                    WHERE stock_code = ? AND trade_date = ?
-                    """,
-                    (stock_code, today),
-                ).fetchone()
-            finally:
-                conn.close()
+        try:
+            with cls._pe_cache_lock:
+                conn = sqlite3.connect(cls._pe_cache_db_path(), timeout=30)
+                conn.row_factory = sqlite3.Row
+                try:
+                    row = conn.execute(
+                        """
+                        SELECT pe_history, pe_percentile_years FROM pe_percentile_cache
+                        WHERE stock_code = ? AND trade_date = ?
+                        """,
+                        (stock_code, today),
+                    ).fetchone()
+                finally:
+                    conn.close()
+        except sqlite3.Error as e:
+            print(f"  [PE缓存] 读取失败，跳过缓存: {e}", flush=True)
+            return None
 
         if row is None:
+            return None
+        if row["pe_percentile_years"] != PE_PERCENTILE_YEARS:
             return None
 
         try:
@@ -540,36 +579,39 @@ class ToolExecutor:
 
         now = datetime.now().isoformat(timespec="seconds")
         today = date.today().isoformat()
-        with cls._pe_cache_lock:
-            conn = sqlite3.connect(cls._pe_cache_db_path(), timeout=30)
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO pe_percentile_cache (
-                        stock_code, trade_date, pe_history, pe_percentile_years,
-                        pe_percentile_lo, pe_percentile_hi, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(stock_code) DO UPDATE SET
-                        trade_date = excluded.trade_date,
-                        pe_history = excluded.pe_history,
-                        pe_percentile_years = excluded.pe_percentile_years,
-                        pe_percentile_lo = excluded.pe_percentile_lo,
-                        pe_percentile_hi = excluded.pe_percentile_hi,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        stock_code,
-                        today,
-                        json.dumps(sorted(historical_pes), ensure_ascii=False),
-                        pe_info.get("pe_percentile_years") or len(historical_pes),
-                        pe_info.get("pe_percentile_lo") or min(historical_pes),
-                        pe_info.get("pe_percentile_hi") or max(historical_pes),
-                        now,
-                    ),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        try:
+            with cls._pe_cache_lock:
+                conn = sqlite3.connect(cls._pe_cache_db_path(), timeout=30)
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO pe_percentile_cache (
+                            stock_code, trade_date, pe_history, pe_percentile_years,
+                            pe_percentile_lo, pe_percentile_hi, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(stock_code) DO UPDATE SET
+                            trade_date = excluded.trade_date,
+                            pe_history = excluded.pe_history,
+                            pe_percentile_years = excluded.pe_percentile_years,
+                            pe_percentile_lo = excluded.pe_percentile_lo,
+                            pe_percentile_hi = excluded.pe_percentile_hi,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            stock_code,
+                            today,
+                            json.dumps(sorted(historical_pes), ensure_ascii=False),
+                            pe_info.get("pe_percentile_years") or len(historical_pes),
+                            pe_info.get("pe_percentile_lo") or min(historical_pes),
+                            pe_info.get("pe_percentile_hi") or max(historical_pes),
+                            now,
+                        ),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+        except sqlite3.Error as e:
+            print(f"  [PE缓存] 写入失败，跳过缓存: {e}", flush=True)
 
     @staticmethod
     def _compact_pe_percentile(pe_info: dict) -> dict:
@@ -582,10 +624,33 @@ class ToolExecutor:
             }
         return compact
 
+    @classmethod
+    def _warm_pe_percentile_cache_async(cls, stock_code: str, current_pe: float):
+        with cls._pe_cache_warming_lock:
+            if stock_code in cls._pe_cache_warming:
+                return
+            cls._pe_cache_warming.add(stock_code)
+
+        def worker():
+            try:
+                with console_timer("后台计算", f"PE历史百分位 {stock_code}"):
+                    pe_info = cls._compute_pe_percentile(stock_code, current_pe)
+                cls._save_cached_pe_history(stock_code, pe_info)
+            finally:
+                with cls._pe_cache_warming_lock:
+                    cls._pe_cache_warming.discard(stock_code)
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"pe-percentile-{stock_code}",
+            daemon=True,
+        )
+        thread.start()
+
     @staticmethod
     def _compute_pe_percentile(stock_code: str, current_pe: float,
                                fin_df=None, price_df=None) -> dict:
-        """计算当前 PE 在近 10 年历史中的分位。返回 pe_percentile_pct 等字段。
+        """计算当前 PE 在近 3 年历史中的分位。返回 pe_percentile_pct 等字段。
 
         测试时可直接传入 fin_df / price_df，跳过 akshare 调用。
         """
@@ -601,11 +666,13 @@ class ToolExecutor:
             if fin_df.empty or "基本每股收益" not in fin_df.columns:
                 return {"pe_percentile_pct": None, "pe_percentile_note": "无财务EPS数据"}
 
-            # 10年日K线（腾讯源，Docker 内可用）
+            # 3年日K线（腾讯源，Docker 内可用）
             if price_df is None:
                 import akshare as ak
                 end_date = pd.Timestamp.now().strftime("%Y%m%d")
-                start_date = (pd.Timestamp.now() - pd.DateOffset(years=10)).strftime("%Y%m%d")
+                start_date = (
+                    pd.Timestamp.now() - pd.DateOffset(years=PE_PERCENTILE_YEARS)
+                ).strftime("%Y%m%d")
                 prefix = exchange_prefix(stock_code)
                 price_df = ak.stock_zh_a_hist_tx(
                     symbol=f"{prefix}{stock_code}", start_date=start_date,
@@ -615,9 +682,10 @@ class ToolExecutor:
                 return {"pe_percentile_pct": None, "pe_percentile_note": "无历史价格数据"}
 
             price_df["date"] = pd.to_datetime(price_df["date"])
+            min_price_date = price_df["date"].min()
 
             # 每年报告期找最近交易日收盘价，计算该年 PE
-            # 财务数据按年份升序排列，取最近 10 年且落在 K 线范围内的
+            # 只取最近 3 年且落在 K 线范围内的年度财务数据。
             fin_df = fin_df.sort_values("报告期", ascending=False)
             historical_pes = []
             for _, row in fin_df.iterrows():
@@ -627,7 +695,7 @@ class ToolExecutor:
                     year = int(year_str[:4])
                     report_date = pd.Timestamp(year=year, month=12, day=31)
                     # 只匹配有价格数据的年份
-                    if report_date < price_df["date"].min():
+                    if report_date < min_price_date:
                         continue
 
                     eps_str = row["基本每股收益"]
@@ -644,6 +712,8 @@ class ToolExecutor:
                     close_price = float(nearby.iloc[-1]["close"])
                     if close_price > 0:
                         historical_pes.append(round(close_price / eps, 2))
+                    if len(historical_pes) >= PE_PERCENTILE_YEARS:
+                        break
                 except (ValueError, TypeError, KeyError):
                     continue
 
@@ -713,7 +783,12 @@ class ToolExecutor:
             dividend_source_date=str(row["除权除息日"].date()),
         )
 
-    def _tool_get_stock_data(self, stock_code: str) -> dict:
+    def _tool_get_stock_data(
+        self,
+        stock_code: str,
+        include_pe_percentile: bool = False,
+        async_pe_percentile: bool = True,
+    ) -> dict:
         # 腾讯行情（Docker 内可用，延迟低）
         try:
             with console_timer("数据查询", f"腾讯行情 {stock_code}"):
@@ -758,11 +833,18 @@ class ToolExecutor:
         if pe_num and pe_num > 0:
             with console_timer("数据计算", f"PE历史百分位缓存 {stock_code}"):
                 pe_pct_info = self._load_cached_pe_percentile(stock_code, pe_num)
-            if pe_pct_info is None:
-                # 缓存未命中才拉年度EPS和10年K线；这是全项目最重的行情计算之一。
+            if pe_pct_info is None and include_pe_percentile:
+                # 显式要求时才同步拉年度EPS和K线；这是全项目最重的行情计算之一。
                 with console_timer("数据计算", f"PE历史百分位 {stock_code}"):
                     pe_pct_info = self._compute_pe_percentile(stock_code, pe_num)
                 self._save_cached_pe_history(stock_code, pe_pct_info)
+            elif pe_pct_info is None:
+                if async_pe_percentile:
+                    self._warm_pe_percentile_cache_async(stock_code, pe_num)
+                pe_pct_info = {
+                    "pe_percentile_pct": None,
+                    "pe_percentile_note": "未同步计算；后台缓存中" if async_pe_percentile else "未同步计算",
+                }
         else:
             pe_pct_info = {"pe_percentile_pct": None, "pe_percentile_note": "当前PE无效"}
         pe_pct_info = self._compact_pe_percentile(pe_pct_info)

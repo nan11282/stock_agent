@@ -37,6 +37,6 @@ def build_default_llm() -> OpenAIAdapter:
         model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"),
         base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         api_key=os.environ.get("DEEPSEEK_API_KEY_stock_agent"),
-        timeout=_env_float("LLM_TIMEOUT_SECONDS", 180.0),
+        timeout=_env_float("LLM_TIMEOUT_SECONDS", 600.0),
         max_retries=max(0, _env_int("LLM_MAX_RETRIES", 0)),
     )

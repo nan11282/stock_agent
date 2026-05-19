@@ -27,6 +27,22 @@ def _read_tool_max_workers(n: int) -> int:
     return min(max(1, int(os.environ.get("READ_TOOL_MAX_WORKERS", "5"))), n)
 
 
+def _llm_analysis_max_attempts() -> int:
+    raw = os.environ.get("LLM_ANALYSIS_MAX_ATTEMPTS", "3")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 3
+
+
+def _llm_analysis_retry_delay_seconds() -> float:
+    raw = os.environ.get("LLM_ANALYSIS_RETRY_DELAY_SECONDS", "2")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 2.0
+
+
 class DailyScanner:
     def __init__(self):
         self.memory = MemoryManager()
@@ -121,12 +137,22 @@ class DailyScanner:
                 signal = "normal"
                 summary_parts = [f"现价{price}"]
 
+                if w.get("alert_price_below") and price <= w["alert_price_below"]:
+                    signal = "alert"
+                    summary_parts.append(f"跌到强提醒价{w['alert_price_below']}")
+                elif w.get("watch_price_below") and price <= w["watch_price_below"]:
+                    signal = "alert"
+                    summary_parts.append(f"跌到观察价{w['watch_price_below']}")
+
                 if ttm_yield is not None:
                     summary_parts.append(f"TTM股息率{ttm_yield}%")
                     if w.get("alert_yield") and ttm_yield >= w["alert_yield"]:
                         # 自选股的提醒不是“买入指令”，只是说明用户预设的观察条件已经触发。
                         signal = "alert"
                         summary_parts.append(f"达到股息率阈值{w['alert_yield']}%")
+
+                if w.get("alert_note"):
+                    summary_parts.append(f"复核: {w['alert_note']}")
 
                 results.append({
                     "scope": "watchlist",
@@ -248,7 +274,10 @@ class DailyScanner:
         final_text = ""
         for step in range(8):
             with console_timer("scheduler", f"LLM step={step + 1}"):
-                resp = self.llm.chat(messages, READ_TOOLS, system)
+                try:
+                    resp = self._chat_with_retries(messages, system)
+                except Exception as e:
+                    return self._fallback_analysis(pos_results, watch_results, disc_results, e)
             if not resp.tool_calls:
                 final_text = resp.text or ""
                 break
@@ -280,6 +309,50 @@ class DailyScanner:
             final_text = f"[警告] 分析达到最大步数 {8}，强制终止。\n\n{resp.text or ''}"
 
         return final_text or "分析生成失败"
+
+    def _chat_with_retries(self, messages: list[Message], system: str):
+        max_attempts = _llm_analysis_max_attempts()
+        delay = _llm_analysis_retry_delay_seconds()
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self.llm.chat(messages, READ_TOOLS, system)
+            except Exception as e:
+                print(f"  [LLM失败] 第 {attempt}/{max_attempts} 次: {type(e).__name__}: {e}")
+                if attempt >= max_attempts:
+                    raise
+                if delay:
+                    time.sleep(delay)
+
+    @staticmethod
+    def _fallback_analysis(pos_results: list, watch_results: list,
+                           disc_results: list, error: Exception) -> str:
+        def render_section(title: str, items: list[dict]) -> list[str]:
+            lines = [f"【{title}】"]
+            if not items:
+                lines.append("- 无")
+                return lines
+            for item in items:
+                name = item.get("stock_name") or item.get("stock_code") or "未命名"
+                code = item.get("stock_code")
+                label = f"{name}({code})" if code else name
+                signal = item.get("signal", "unknown")
+                summary = item.get("summary", "")
+                lines.append(f"- [{signal}] {label}: {summary}")
+            return lines
+
+        reason = f"{type(error).__name__}: {error}"
+        lines = [
+            "[降级报告] LLM 深度分析连续失败，已停止重试。本次邮件保留规则扫描结果，便于人工复核。",
+            f"失败原因: {reason}",
+            "",
+        ]
+        lines.extend(render_section("持仓扫描", pos_results))
+        lines.append("")
+        lines.extend(render_section("自选监控", watch_results))
+        lines.append("")
+        lines.extend(render_section("市场发现", disc_results))
+        return "\n".join(lines)
 
     # ── 主入口 ────────────────────────────────
 

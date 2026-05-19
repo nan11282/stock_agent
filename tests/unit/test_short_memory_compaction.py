@@ -179,3 +179,18 @@ def test_reset_without_session_does_not_write_memory(monkeypatch):
     assert agent.history == []
     assert agent.history_summary is None
     assert agent.memory.episodic.saved == []
+
+
+def test_clear_discards_short_memory_without_writing_memory(monkeypatch):
+    monkeypatch.setenv("ASYNC_MEMORY_WRITE", "false")
+    agent = _agent()
+    _add_turn(agent, 1)
+    agent.history_summary = "旧摘要"
+    agent.pending_write_calls = [ToolCall(id="call_1", name="upsert_position", input={})]
+
+    agent.clear()
+
+    assert agent.history == []
+    assert agent.history_summary is None
+    assert agent.pending_write_calls == []
+    assert agent.memory.episodic.saved == []

@@ -7,6 +7,16 @@ Agent 只和中性 Message 类型打交道；每个 Adapter 负责把中性格�
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Iterator, cast
+
+from anthropic.types import (
+    ContentBlockParam,
+    MessageParam,
+    TextBlockParam,
+    ToolParam,
+    ToolResultBlockParam,
+    ToolUseBlockParam,
+)
 
 
 # ─────────────────────────────────────────────
@@ -49,6 +59,12 @@ class LLMResponse:
     reasoning_content: str | None = None
 
 
+@dataclass
+class LLMStreamChunk:
+    text_delta: str = ""
+    response: LLMResponse | None = None
+
+
 # ─────────────────────────────────────────────
 # Adapter 接口
 # ─────────────────────────────────────────────
@@ -58,6 +74,17 @@ class LLMAdapter(ABC):
     @abstractmethod
     def chat(self, messages: list[Message], tools: list[dict], system: str) -> LLMResponse:
         ...
+
+    def chat_stream(
+        self,
+        messages: list[Message],
+        tools: list[dict],
+        system: str,
+    ) -> Iterator[LLMStreamChunk]:
+        response = self.chat(messages, tools, system)
+        if response.text:
+            yield LLMStreamChunk(text_delta=response.text)
+        yield LLMStreamChunk(response=response)
 
 
 class LLMTimeoutError(TimeoutError):
@@ -75,51 +102,60 @@ class ClaudeAdapter(LLMAdapter):
         self.model = model
 
     @staticmethod
-    def _to_anthropic(messages: list[Message]) -> list[dict]:
+    def _to_anthropic(messages: list[Message]) -> list[MessageParam]:
         # Anthropic 把 tool_result 放在 user content block 里，
         # 适配层负责格式差异，避免污染 Agent 的业务逻辑。
-        out: list[dict] = []
+        out: list[MessageParam] = []
         for m in messages:
             if m.role == "user":
                 if m.tool_results:
+                    blocks: list[ToolResultBlockParam] = [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": r.tool_call_id,
+                            "content": r.content,
+                        }
+                        for r in m.tool_results
+                    ]
                     out.append({
                         "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": r.tool_call_id,
-                                "content": r.content,
-                            }
-                            for r in m.tool_results
-                        ],
+                        "content": blocks,
                     })
                 else:
                     out.append({"role": "user", "content": m.text or ""})
             elif m.role == "assistant":
-                blocks: list[dict] = []
+                blocks: list[ContentBlockParam] = []
                 if m.text:
-                    blocks.append({"type": "text", "text": m.text})
+                    text_block: TextBlockParam = {"type": "text", "text": m.text}
+                    blocks.append(text_block)
                 for tc in m.tool_calls:
-                    blocks.append({
+                    tool_block: ToolUseBlockParam = {
                         "type": "tool_use",
                         "id": tc.id,
                         "name": tc.name,
-                        "input": tc.input,
-                    })
+                        "input": cast(dict[str, object], tc.input),
+                    }
+                    blocks.append(tool_block)
                 out.append({"role": "assistant", "content": blocks})
         return out
 
     def chat(self, messages: list[Message], tools: list[dict], system: str) -> LLMResponse:
-        kwargs = dict(
-            model=self.model,
-            max_tokens=4096,
-            system=system,
-            messages=self._to_anthropic(messages),
-        )
+        anthropic_messages = self._to_anthropic(messages)
         if tools:
-            kwargs["tools"] = tools
-
-        resp = self.client.messages.create(**kwargs)
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=4096,
+                system=system,
+                messages=anthropic_messages,
+                tools=cast(list[ToolParam], tools),
+            )
+        else:
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=4096,
+                system=system,
+                messages=anthropic_messages,
+            )
 
         text = None
         tool_calls = []
@@ -199,13 +235,9 @@ class OpenAIAdapter(LLMAdapter):
                 out.append(msg)
         return out
 
-    def chat(self, messages: list[Message], tools: list[dict], system: str) -> LLMResponse:
-        import json
-        from metrics import console_timer
-
-        full_messages = [{"role": "system", "content": system}] + self._to_openai(messages)
-
-        oai_tools = [
+    @staticmethod
+    def _to_openai_tools(tools: list[dict] | None) -> list[dict] | None:
+        return [
             # 项目自己的 tool schema 转成 OpenAI function calling schema。
             {"type": "function", "function": {
                 "name": t["name"],
@@ -215,14 +247,24 @@ class OpenAIAdapter(LLMAdapter):
             for t in tools
         ] if tools else None
 
+    def _chat_kwargs(self, messages: list[Message], tools: list[dict], system: str) -> dict:
+        full_messages = [{"role": "system", "content": system}] + self._to_openai(messages)
+        return {
+            "model": self.model,
+            "messages": full_messages,
+            "tools": self._to_openai_tools(tools),
+            "timeout": self.timeout,
+        }
+
+    def chat(self, messages: list[Message], tools: list[dict], system: str) -> LLMResponse:
+        import json
+        from metrics import console_timer
+
+        kwargs = self._chat_kwargs(messages, tools, system)
+
         try:
-            with console_timer("LLM API", f"model={self.model} messages={len(full_messages)} tools={len(tools or [])}"):
-                resp = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=full_messages,
-                    tools=oai_tools,
-                    timeout=self.timeout,
-                )
+            with console_timer("LLM API", f"model={self.model} messages={len(kwargs['messages'])} tools={len(tools or [])}"):
+                resp = self.client.chat.completions.create(**kwargs)
         except Exception as e:
             if _is_timeout_exception(e):
                 raise LLMTimeoutError(
@@ -250,6 +292,87 @@ class OpenAIAdapter(LLMAdapter):
             stop_reason="tool_use" if tool_calls else "end_turn",
             reasoning_content=reasoning,
         )
+
+    def chat_stream(
+        self,
+        messages: list[Message],
+        tools: list[dict],
+        system: str,
+    ) -> Iterator[LLMStreamChunk]:
+        import json
+        from metrics import console_timer
+
+        kwargs = self._chat_kwargs(messages, tools, system)
+        kwargs["stream"] = True
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_call_parts: dict[int, dict] = {}
+        finish_reason = None
+
+        try:
+            with console_timer("LLM API stream", f"model={self.model} messages={len(kwargs['messages'])} tools={len(tools or [])}"):
+                stream = self.client.chat.completions.create(**kwargs)
+                for chunk in stream:
+                    if not getattr(chunk, "choices", None):
+                        continue
+                    choice = chunk.choices[0]
+                    finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+                    delta = getattr(choice, "delta", None)
+                    if delta is None:
+                        continue
+
+                    text_delta = getattr(delta, "content", None)
+                    if text_delta:
+                        content_parts.append(text_delta)
+                        yield LLMStreamChunk(text_delta=text_delta)
+
+                    reasoning_delta = getattr(delta, "reasoning_content", None)
+                    if reasoning_delta:
+                        reasoning_parts.append(reasoning_delta)
+
+                    for tc in getattr(delta, "tool_calls", None) or []:
+                        index = getattr(tc, "index", None)
+                        if index is None:
+                            index = len(tool_call_parts)
+                        part = tool_call_parts.setdefault(index, {
+                            "id": "",
+                            "name": "",
+                            "arguments": [],
+                        })
+                        if getattr(tc, "id", None):
+                            part["id"] = tc.id
+                        fn = getattr(tc, "function", None)
+                        if fn is not None:
+                            if getattr(fn, "name", None):
+                                part["name"] += fn.name
+                            if getattr(fn, "arguments", None):
+                                part["arguments"].append(fn.arguments)
+        except Exception as e:
+            if _is_timeout_exception(e):
+                raise LLMTimeoutError(
+                    f"LLM request timed out after {self.timeout.read:g} seconds"
+                ) from e
+            raise
+
+        tool_calls = []
+        for index in sorted(tool_call_parts):
+            part = tool_call_parts[index]
+            arguments = "".join(part["arguments"])
+            tool_input = json.loads(arguments) if arguments else {}
+            tool_calls.append(ToolCall(
+                id=part["id"],
+                name=part["name"],
+                input=tool_input,
+            ))
+
+        response = LLMResponse(
+            text="".join(content_parts) or None,
+            tool_calls=tool_calls,
+            stop_reason="tool_use" if tool_calls or finish_reason == "tool_calls" else "end_turn",
+            reasoning_content="".join(reasoning_parts) or None,
+        )
+        yield LLMStreamChunk(response=response)
 
 
 def _is_timeout_exception(exc: Exception) -> bool:

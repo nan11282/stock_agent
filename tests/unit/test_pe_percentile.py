@@ -2,6 +2,7 @@
 
 import pandas as pd
 import pytest
+import tools
 
 from tools import ToolExecutor
 
@@ -22,18 +23,18 @@ def _price_df(year_close_pairs: list[tuple[int, float]]) -> pd.DataFrame:
 
 
 def test_basic_percentile_when_current_pe_low():
-    """历史 PE: [10,12,14,16,18,20]，当前 PE=11 → 1/6 ≈ 16.7%。"""
+    """只取最近 3 年历史 PE: [16,18,20]，当前 PE=17 → 1/3 ≈ 33.3%。"""
     eps_pairs = [(2018, 1.0), (2019, 1.0), (2020, 1.0),
                  (2021, 1.0), (2022, 1.0), (2023, 1.0)]
     price_pairs = [(2018, 10), (2019, 12), (2020, 14),
                    (2021, 16), (2022, 18), (2023, 20)]
     result = ToolExecutor._compute_pe_percentile(
-        "600028", current_pe=11.0,
+        "600028", current_pe=17.0,
         fin_df=_fin_df(eps_pairs), price_df=_price_df(price_pairs),
     )
-    assert result["pe_percentile_pct"] == pytest.approx(16.7, abs=0.1)
-    assert result["pe_percentile_years"] == 6
-    assert result["pe_percentile_lo"] == 10.0
+    assert result["pe_percentile_pct"] == pytest.approx(33.3, abs=0.1)
+    assert result["pe_percentile_years"] == 3
+    assert result["pe_percentile_lo"] == 16.0
     assert result["pe_percentile_hi"] == 20.0
 
 
@@ -70,8 +71,7 @@ def test_skip_negative_eps_year():
         "600028", current_pe=10.0,
         fin_df=_fin_df(eps_pairs), price_df=_price_df(price_pairs),
     )
-    # 6 年里有 1 年亏损 → 5 年有效
-    assert result["pe_percentile_years"] == 5
+    assert result["pe_percentile_years"] == 3
 
 
 def test_too_few_years_returns_note():
@@ -106,10 +106,10 @@ def test_cached_pe_history_recomputes_percentile_for_current_pe(tmp_path, monkey
     monkeypatch.setenv("DB_PATH", str(tmp_path / "investment.db"))
     pe_info = {
         "pe_percentile_pct": 0.0,
-        "pe_percentile_years": 4,
+        "pe_percentile_years": 3,
         "pe_percentile_lo": 10.0,
-        "pe_percentile_hi": 40.0,
-        "pe_history": [10.0, 20.0, 30.0, 40.0],
+        "pe_percentile_hi": 30.0,
+        "pe_history": [10.0, 20.0, 30.0],
     }
 
     ToolExecutor._init_pe_cache()
@@ -117,7 +117,35 @@ def test_cached_pe_history_recomputes_percentile_for_current_pe(tmp_path, monkey
     cached = ToolExecutor._load_cached_pe_percentile("600028", current_pe=35.0)
 
     assert cached["pe_percentile_cached"] is True
-    assert cached["pe_percentile_pct"] == 75.0
+    assert cached["pe_percentile_pct"] == pytest.approx(100.0)
+
+
+def test_pe_cache_init_degrades_when_sqlite_unavailable(monkeypatch):
+    class BrokenConn:
+        def execute(self, *args, **kwargs):
+            raise tools.sqlite3.OperationalError("unable to open database file")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("tools.sqlite3.connect", lambda *args, **kwargs: BrokenConn())
+
+    ToolExecutor(memory=None)
+
+
+def test_pe_cache_read_write_degrade_when_sqlite_unavailable(monkeypatch):
+    def fail_connect(*args, **kwargs):
+        raise tools.sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr("tools.sqlite3.connect", fail_connect)
+
+    assert ToolExecutor._load_cached_pe_percentile("600028", current_pe=10.0) is None
+    ToolExecutor._save_cached_pe_history("600028", {
+        "pe_percentile_years": 3,
+        "pe_percentile_lo": 10.0,
+        "pe_percentile_hi": 30.0,
+        "pe_history": [10.0, 20.0, 30.0],
+    })
 
 
 def test_compact_pe_percentile_removes_history_payload():
