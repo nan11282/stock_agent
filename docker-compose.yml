@@ -77,3 +77,29 @@ services:
       - ./model_cache:/root/.cache/huggingface
       - .:/app
     restart: unless-stopped
+
+  admin:
+    build: .
+    profiles: [ "admin" ]
+    command: [ "python", "app/admin.py" ]
+    environment:
+      - ADMIN_HOST=0.0.0.0
+      - ADMIN_PORT=8787
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - DB_PATH=${DB_PATH:-/app/data/investment_live.db}
+      - SQLITE_JOURNAL_MODE=${SQLITE_JOURNAL_MODE:-DELETE}
+      - CHROMA_PATH=/app/chroma_db
+      - HF_HOME=/root/.cache/huggingface
+      - RERANK_ENABLED=${RERANK_ENABLED:-false}
+      - RERANK_MODEL=${RERANK_MODEL:-BAAI/bge-reranker-base}
+      - RERANK_POOL_SIZE=${RERANK_POOL_SIZE:-12}
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "${ADMIN_BIND:-127.0.0.1}:${ADMIN_PORT:-8787}:8787"
+    volumes:
+      - ./data:/app/data
+      - ./chroma_db:/app/chroma_db
+      - ./model_cache:/root/.cache/huggingface
+      - .:/app
+    restart: unless-stopped

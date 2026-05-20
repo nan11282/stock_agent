@@ -483,6 +483,117 @@ class EpisodicMemory:
             self.conn.commit()
         return doc_id
 
+    def list_insights(
+        self, keyword: str | None = None, limit: int = 50, offset: int = 0
+    ) -> list[dict]:
+        # 后台管理需要“可审计原文”，直接以 SQLite 为准；
+        # ChromaDB 只承担检索索引，不作为管理端的事实来源。
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        params: list = []
+        query = "SELECT * FROM episodic_docs"
+        if keyword:
+            query += " WHERE text LIKE ? OR metadata LIKE ? OR doc_id LIKE ?"
+            params.extend([f"%{keyword}%"] * 3)
+        query += " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        rows = self.conn.execute(query, params).fetchall()
+        return [self._format_insight_row(row) for row in rows]
+
+    def get_insight(self, doc_id: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM episodic_docs WHERE doc_id=?", (doc_id,)
+        ).fetchone()
+        return self._format_insight_row(row) if row else None
+
+    def update_insight(self, doc_id: str, text: str, metadata: dict | None = None) -> bool:
+        row = self.conn.execute(
+            "SELECT id, metadata FROM episodic_docs WHERE doc_id=?", (doc_id,)
+        ).fetchone()
+        if row is None:
+            return False
+
+        now = datetime.now().isoformat()
+        existing_meta = self._decode_metadata(row["metadata"])
+        meta = {**existing_meta, **(metadata or {}), "updated_at": now}
+
+        with console_timer("记忆更新", "ChromaDB upsert"):
+            self._upsert_chroma_doc(doc_id, text, meta)
+
+        with console_timer("记忆更新", "SQLite episodic_docs"):
+            self.conn.execute(
+                """
+                UPDATE episodic_docs
+                SET text=?, metadata=?
+                WHERE doc_id=?
+                """,
+                (text, json.dumps(meta, ensure_ascii=False), doc_id),
+            )
+
+        with console_timer("记忆更新", "FTS5 rebuild"):
+            self.conn.execute("DELETE FROM episodic_fts WHERE rowid=?", (row["id"],))
+            self.conn.execute(
+                "INSERT INTO episodic_fts(rowid, text, doc_id) VALUES (?, ?, ?)",
+                (row["id"], self._tokenize(text), doc_id),
+            )
+            self.conn.commit()
+        return True
+
+    def delete_insight(self, doc_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT id FROM episodic_docs WHERE doc_id=?", (doc_id,)
+        ).fetchone()
+        if row is None:
+            return False
+
+        with console_timer("记忆删除", "ChromaDB delete"):
+            try:
+                self.collection.delete(ids=[doc_id])
+            except Exception as e:
+                print(f"  [ChromaDB] 删除失败，继续清理SQLite: {e}", flush=True)
+
+        with console_timer("记忆删除", "SQLite + FTS5"):
+            self.conn.execute("DELETE FROM episodic_fts WHERE rowid=?", (row["id"],))
+            self.conn.execute("DELETE FROM episodic_docs WHERE doc_id=?", (doc_id,))
+            self.conn.commit()
+        return True
+
+    @staticmethod
+    def _decode_metadata(raw: str | None) -> dict:
+        if not raw:
+            return {}
+        try:
+            decoded = json.loads(raw)
+            return decoded if isinstance(decoded, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    @classmethod
+    def _format_insight_row(cls, row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "doc_id": row["doc_id"],
+            "text": row["text"],
+            "metadata": cls._decode_metadata(row["metadata"]),
+            "created_at": row["created_at"],
+        }
+
+    def _upsert_chroma_doc(self, doc_id: str, text: str, metadata: dict) -> None:
+        existing = self.collection.get(ids=[doc_id], include=[])
+        if existing.get("ids"):
+            self.collection.update(
+                ids=[doc_id],
+                documents=[text],
+                metadatas=[metadata],
+            )
+        else:
+            self.collection.add(
+                ids=[doc_id],
+                documents=[text],
+                metadatas=[metadata],
+            )
+
     # ── RRF 融合（纯数学，可独立单测）─────────
 
     @staticmethod

@@ -8,8 +8,9 @@ AI 驱动的 A 股投资助手。CLI 对话 + Telegram 聊天机器人，支持�
 - **每日报告**：15:30 自动扫描持仓/自选/市场发现，LLM 深度分析（800+ 字研报）
 - **CLI 对话**：ReAct Agent + 16 个工具（行情/财务/分红/持仓管理/记忆检索）
 - **记忆系统**：ChromaDB 向量 + SQLite FTS5 全文检索，RRF 融合，跨设备共享上下文
+- **后台管理**：本地 Web 管理长期洞察、持仓、自选、决策日志和扫描快照
 
-**技术栈**：Python 3.12 · DeepSeek · Telegram Bot API · AKShare · SQLite + ChromaDB FTS5 · Docker
+**技术栈**：Python 3.12 · DeepSeek · Telegram Bot API · AKShare · SQLite + ChromaDB FTS5 · Docker · 标准库 Admin
 
 ---
 
@@ -46,6 +47,8 @@ MAIL_PASS=你的SMTP授权码（16位）
 MAIL_TO=接收报告的邮箱地址
 
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+
+ADMIN_TOKEN=一段足够长的后台口令
 ```
 
 > `.env` 已加入 `.gitignore`，不会被提交。
@@ -57,7 +60,7 @@ docker compose build
 docker compose up -d
 ```
 
-两个服务：`agent` 和 `scheduler`（定时扫描 + Telegram Bot）。
+默认启动两个服务：`agent` 和 `scheduler`（定时扫描 + Telegram Bot）。后台管理按需启动，避免未配置口令时暴露管理入口。
 
 ---
 
@@ -81,13 +84,29 @@ docker compose up -d
 ### CLI 对话
 
 ```bash
-docker compose exec -it agent python main.py
+docker compose exec -it agent python app/main.py
 ```
+
+### 后台管理
+
+```bash
+docker compose --profile admin up -d admin
+```
+
+打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，用 `.env` 里的 `ADMIN_TOKEN` 登录。后台默认只映射到本机，可以直接查看和管理：
+
+| 页面 | 用途 |
+|------|------|
+| 记忆 | 新增、编辑、删除长期洞察；同步维护 SQLite、FTS5 和 ChromaDB |
+| 持仓 | 新增、更新、删除当前组合事实 |
+| 自选 | 管理关注原因、估值/价格提醒阈值和人工复核备注 |
+| 决策 | 追加或删除决策日志，保持历史判断可追溯 |
+| 扫描 | 查看每日扫描快照 |
 
 ### 手动触发扫描
 
 ```bash
-docker compose exec scheduler python scheduler.py --now
+docker compose exec scheduler python app/scheduler.py --now
 ```
 
 ### 每日定时
@@ -118,6 +137,7 @@ docker compose exec scheduler python scheduler.py --now
 stock_agent/
 ├── main.py           # CLI 入口
 ├── agent.py          # ReAct Agent 核心循环
+├── admin.py          # 本地后台管理
 ├── tools.py          # 16 个工具（9 读 + 7 写）+ 腾讯行情
 ├── adapters.py       # LLM 适配层（Claude / OpenAI / DeepSeek）
 ├── memory.py         # SQLite + ChromaDB + RRF 混合检索
